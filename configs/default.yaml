@@ -1,0 +1,58 @@
+video_file: video.mp4
+
+record:
+  camera: 1
+  width: 1920
+  height: 1080
+  fps: 30
+
+blur_filter:         # Buoc 1
+  score_width: 640
+  window: 5
+  min_ratio: 0.6
+  max_frames: 60
+  save_max_side: 1920
+  jpg_quality: 95
+
+masking:             # Buoc 2
+  prompt: "box"
+  dino_model_id: "IDEA-Research/grounding-dino-tiny"
+  dino_dir: models/grounding_dino
+  box_threshold: 0.3
+  text_threshold: 0.25
+  detect_frames: 5
+  sam2_config: "configs/sam2.1/sam2.1_hiera_t.yaml"
+  sam2_checkpoint: models/sam2/sam2.1_hiera_tiny.pt
+  dilate_px: 0              # giu nguyen nhu ban dau: khong dilate
+
+reconstruction:      # Buoc 3
+  method: colmap_mvs
+  mvs_max_image_size: 800   # giu nguyen gia tri goc
+  mvs_geom_consistency: false  # giu nguyen gia tri goc
+  capture_mode: turntable  # QUAN TRONG: doi thanh orbit neu quay tay
+  turntable_n_turns: 1.0     # so vong xoay trong video (thuong la 1)
+  turntable_elevation: 10.0  # goc nang camera so voi mat phang dat (do)
+                             # nhin anh 2: camera gan ngang voi hop -> ~10 do
+                             # tang len 20-30 neu camera dat cao hon vat the nhieu
+  turntable_radius: 2.0      # ban kinh ao (don vi nerfstudio, khong phai met)
+  matching_method: exhaustive
+  min_pose_ratio: 0.5
+
+mesh_export:         # Buoc 4
+  mesh_mode: poisson
+  poisson_depth: 7
+  poisson_density_quantile: 0.05
+  stat_nb: 20
+  stat_ratio: 2.0
+  rad_nb: 5
+  rad_radius_frac: 0.03
+  voxel_frac: 0.004
+  normal_radius_frac: 0.05
+  normal_nn: 30
+  orient_k: 15
+  smooth_iter: 5
+  smooth_lambda: 0.5
+
+  # --- Cat phan thua o day (vay Poisson) ---
+  # 0.01 = 1%: cat sat -> bo vay thua; tang 0.03 neu mat goc/vien
+  poisson_hull_pad_frac: 0.01
