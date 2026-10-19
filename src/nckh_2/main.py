@@ -136,6 +136,7 @@ def main() -> None:
                     help="nguon du lieu: record = quay moi, sample = mau co san")
     ap.add_argument("--name",    help="ten mau")
     ap.add_argument("--camera",  help="chi so camera hoac URL (ghi de config)")
+    ap.add_argument("--prompt",  help="tu khoa nhan dien vat the cho Grounded-SAM 2 (ghi de config)")
     ap.add_argument("--mode",    choices=list(MODES),
                     help="che do quay: orbit | turntable")
     ap.add_argument("--start",   type=int, default=1, choices=list(STEPS),
@@ -168,11 +169,25 @@ def main() -> None:
         print("Khong co mau de xu ly. Thoat.")
         return
 
+    # Lay va luu prompt nhan dien vat the (buoc 2)
+    meta = _load_meta(name)
+    if args.prompt:
+        cfg["masking"]["prompt"] = args.prompt
+        meta["prompt"] = args.prompt
+        _save_meta(name, meta)
+    elif meta.get("prompt"):
+        cfg["masking"]["prompt"] = meta["prompt"]
+    else:
+        # Neu ten mau co tien to nhu mouse_01, bottle_02, vv.
+        prefix = name.split("_")[0].lower()
+        if prefix and prefix not in ("sample", "video") and cfg["masking"]["prompt"] == "box":
+            cfg["masking"]["prompt"] = prefix
+
     # Lay che do quay (chi hoi khi buoc 2 hoac 3 chay)
     mode = _resolve_mode(name, cfg, args.mode, need_mode)
     cfg["reconstruction"]["capture_mode"] = mode
 
-    print(f"\n>>> Mau: {name}  |  Buoc: {args.start}-{args.until}  |  Mode: {mode}")
+    print(f"\n>>> Mau: {name}  |  Buoc: {args.start}-{args.until}  |  Mode: {mode}  |  Prompt: '{cfg['masking']['prompt']}'")
 
     for step in range(args.start, args.until + 1):
         title, fn = STEPS[step]

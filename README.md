@@ -16,8 +16,11 @@ cd /d D:\nckh_2                                  # Set moi truong
 poetry run nckh                                  # menu: [1] quay truc tiep  [2] dung mau co san
 poetry run nckh --source record --name box_01    # quay: R bat dau/dung, Q thoat
 poetry run nckh --source sample --name box_01    # dung mau da luu
+poetry run nckh --source sample --name mouse_01 --prompt mouse  # vat the cong/phi phang voi prompt tuy chon
 ```
 Dung mau co san: dat video vao `data/samples/<ten_mau>/video.mp4`.
+Vat the phi phang / be mat cong: co the chi dinh `--prompt "<tu_khoa>"` (vi du: `--prompt mouse`, `--prompt cup`),
+he thong se tu dong nhan dien vat the, mo rong padding bien cong, va dung mesh Poisson watertight voi mau sac day du.
 Quay bang dien thoai: dung app IP Webcam / DroidCam roi doi `record.camera` trong `configs/default.yaml`
 thanh URL (hoac quay san roi dung che do mau).
 

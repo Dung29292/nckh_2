@@ -60,34 +60,58 @@ def _load_gaussian_ply(path) -> o3d.geometry.PointCloud:
 # LOC NHIEU
 # ---------------------------------------------------------------------------
 
-def _keep_largest_cluster(pc: o3d.geometry.PointCloud, diag: float) -> o3d.geometry.PointCloud:
-    """Giu lai cluster lon nhat sau DBSCAN.
+def _keep_significant_clusters(
+    pc: o3d.geometry.PointCloud,
+    diag: float,
+    e: dict | None = None,
+) -> o3d.geometry.PointCloud:
+    """Loc nhieu troi noi bang DBSCAN nhung KHONG lam mat cac phan cong/khac mat phang cua vat the.
 
-    Xu ly truc tiep cum nhieu troi noi (nhu cum den o phia tren trong Blender):
-    chung la cluster nho tach biet khoi than chinh cua vat the.
-
-    eps = 1.5% duong cheo: 2 diem trong vong nay duoc xem la cung cluster.
-    min_points = 50: cluster < 50 diem bi bo.
+    Thay vi chi giu 1 cum duy nhat (khien vat the phi phang bi cut/mat 50-70% so diem),
+    thuat toan giu lai cum chinh cung cac cum thanh phan hop le (kich thuoc >= 12% cum chinh),
+    chi loai bo nhieu troi noi thuc su.
     """
-    eps        = 0.015 * diag
-    labels     = np.array(pc.cluster_dbscan(eps=eps, min_points=50, print_progress=False))
-    n_clusters = labels.max() + 1
+    e_dict = e or {}
+    eps_frac = float(e_dict.get("cluster_eps_frac", 0.02))
+    min_pts = int(e_dict.get("cluster_min_points", 40))
+    eps = max(eps_frac * diag, 0.005)
 
+    labels = np.array(pc.cluster_dbscan(eps=eps, min_points=min_pts, print_progress=False))
+    if len(labels) == 0:
+        return pc
+
+    valid_mask = labels >= 0
+    if not np.any(valid_mask):
+        return pc
+
+    counts = np.bincount(labels[valid_mask])
+    n_clusters = len(counts)
     if n_clusters <= 1:
-        return pc   # chi co 1 cluster hoac khong cluster nao -> giu nguyen
+        keep = np.nonzero(labels == 0)[0] if n_clusters == 1 else np.arange(len(labels))
+        return pc.select_by_index(keep)
 
-    # Tim cluster co nhieu diem nhat (khong tinh nhieu = label -1)
-    counts     = np.bincount(labels[labels >= 0])
-    largest    = int(np.argmax(counts))
-    keep       = np.nonzero(labels == largest)[0]
-    n_removed  = len(labels) - len(keep)
-    print(f"  DBSCAN: tim thay {n_clusters} cluster, giu cluster lon nhat "
-          f"({counts[largest]:,} diem), loai {n_removed:,} diem nhieu/cum nho")
-    return pc.select_by_index(keep)
+    largest = int(np.argmax(counts))
+    largest_count = counts[largest]
+
+    # Giu cum lon nhat va cac cum con co quy mo >= cluster_min_ratio so voi cum lon nhat
+    min_cluster_ratio = float(e_dict.get("cluster_min_ratio", 0.12))
+    threshold_count = max(min_pts, int(largest_count * min_cluster_ratio))
+
+    keep_clusters = {c for c, cnt in enumerate(counts) if cnt >= threshold_count}
+    keep_indices = np.nonzero(np.isin(labels, list(keep_clusters)))[0]
+
+    n_removed = len(labels) - len(keep_indices)
+    kept_pts = len(keep_indices)
+    print(
+        f"  DBSCAN (eps={eps:.4f}, min_pts={min_pts}): tim thay {n_clusters} cum. "
+        f"Giu {len(keep_clusters)} cum chu yeu ({kept_pts:,}/{len(labels):,} diem), "
+        f"loai {n_removed:,} diem rac/troi noi."
+    )
+    return pc.select_by_index(keep_indices)
 
 
 def _clean(pc: o3d.geometry.PointCloud, e: dict) -> tuple[o3d.geometry.PointCloud, float]:
-    """Loc thong ke + ban kinh + cluster + (tuy chon) voxel downsample."""
+    """Loc thong ke + ban kinh + cluster thich ung + (tuy chon) voxel downsample."""
     pts = np.asarray(pc.points)
     if len(pts) == 0:
         return pc, 0.0
@@ -117,8 +141,8 @@ def _clean(pc: o3d.geometry.PointCloud, e: dict) -> tuple[o3d.geometry.PointClou
     if len(pc.points) == 0:
         raise RuntimeError("Loc ban kinh xoa het diem. Tang rad_radius_frac trong config.")
 
-    # --- giu cluster lon nhat (loai cum nhieu troi noi) ---
-    pc = _keep_largest_cluster(pc, diag)
+    # --- giu cac cum thuc su thuoc vat the (loai cum nhieu troi noi) ---
+    pc = _keep_significant_clusters(pc, diag, e)
 
     # --- voxel downsample ---
     if e.get("voxel_frac", 0):
@@ -250,9 +274,10 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
     mesh.remove_vertices_by_mask(dens < np.quantile(dens, q))
     print(f"  cat {q:.0%} mat do thap: {n_before:,} -> {len(mesh.vertices):,} dinh")
 
-    # --- Cat theo bbox point cloud mo rong ---
+    # --- Cat theo bbox point cloud mo rong (cat phan vay Poisson ngoai vat the) ---
+    pad_frac = float(e.get("poisson_hull_pad_frac", 0.01))
     bbox = pc.get_axis_aligned_bounding_box()
-    pad  = 0.02 * float(np.linalg.norm(np.asarray(bbox.get_extent())))
+    pad  = pad_frac * float(np.linalg.norm(np.asarray(bbox.get_extent())))
     bbox = o3d.geometry.AxisAlignedBoundingBox(
         bbox.min_bound - pad, bbox.max_bound + pad
     )
@@ -262,22 +287,32 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
     mesh.remove_non_manifold_edges()
-        # --- Giu thanh phan lien thong lon nhat (loai manh mesh roi rac do nhieu) ---
+
+    # Loai bo cac diem pinch / non-manifold vertices de bao toan 2-manifold sach
+    for _ in range(5):
+        nmv = mesh.get_non_manifold_vertices()
+        if len(nmv) == 0:
+            break
+        v_mask = np.zeros(len(mesh.vertices), dtype=bool)
+        v_mask[np.asarray(nmv)] = True
+        mesh.remove_vertices_by_mask(v_mask)
+        mesh.remove_non_manifold_edges()
+
+    # --- Giu thanh phan lien thong lon nhat (loai manh mesh roi rac do nhieu) ---
     tri_clusters, n_tris_per_cluster, _ = mesh.cluster_connected_triangles()
     tri_clusters = np.asarray(tri_clusters)
     n_tris_per_cluster = np.asarray(n_tris_per_cluster)
-    largest = n_tris_per_cluster.argmax()
-    before_t = len(mesh.triangles)
-    mesh.remove_triangles_by_mask(tri_clusters != largest)
-    mesh.remove_unreferenced_vertices()
-    print(f"  giu thanh phan lon nhat: {len(n_tris_per_cluster)} manh, "
-          f"{before_t:,} -> {len(mesh.triangles):,} tam giac")
+    if len(n_tris_per_cluster) > 0:
+        largest = n_tris_per_cluster.argmax()
+        before_t = len(mesh.triangles)
+        mesh.remove_triangles_by_mask(tri_clusters != largest)
+        mesh.remove_unreferenced_vertices()
+        print(f"  giu thanh phan lon nhat: {len(n_tris_per_cluster)} manh, "
+              f"{before_t:,} -> {len(mesh.triangles):,} tam giac")
 
-    # --- Laplacian smoothing: lam min duong cong be mat ---
-    # iter cao hon = min hon, nhung co the mat chi tiet (nut chuot, goc)
-    # lambda_ = cuong do moi buoc dich chuyen (0.5 = trung binh voi lang gieng)
-    n_iter   = e.get("smooth_iter",   5)
-    lam      = e.get("smooth_lambda", 0.5)
+    # --- Laplacian smoothing: lam min duong cong be mat cho vat the phi phang ---
+    n_iter = int(e.get("smooth_iter", 5))
+    lam    = float(e.get("smooth_lambda", 0.5))
     if n_iter > 0:
         mesh = mesh.filter_smooth_laplacian(
             number_of_iterations=n_iter,
@@ -285,9 +320,22 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
         )
         print(f"  Laplacian smooth: iter={n_iter} lambda={lam}")
 
-    # --- Tinh lai phap tuyen TREN MESH (chinh xac hon phap tuyen diem) ---
-    # compute_vertex_normals dung trung binh co trong so cua phap tuyen tam giac
-    # -> bat duong cong dung cua mesh, khong phai uoc tinh tu PCA tren diem
+    # Chuyen mau tu point cloud goc sang mesh vertices neu co mau
+    if pc.has_colors() and len(pc.colors) > 0 and len(mesh.vertices) > 0:
+        try:
+            kdtree = o3d.geometry.KDTreeFlann(pc)
+            pc_colors = np.asarray(pc.colors)
+            m_verts = np.asarray(mesh.vertices)
+            mesh_cols = np.zeros_like(m_verts)
+            for vi, v in enumerate(m_verts):
+                _, idx, _ = kdtree.search_knn_vector_3d(v, 1)
+                mesh_cols[vi] = pc_colors[idx[0]]
+            mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_cols)
+            print("  da gan mau RGB tu point cloud vao dinh mesh")
+        except Exception:
+            pass
+
+    # --- Tinh lai phap tuyen tren mesh ---
     mesh.compute_triangle_normals()
     mesh.compute_vertex_normals()
 
@@ -303,175 +351,97 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
 # DONG KIN MESH (WATERTIGHT)
 # ---------------------------------------------------------------------------
 
-def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:  # noqa: C901
-    """Dong kin open mesh thanh watertight de co the tai hien vat the.
+def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """Dong kin open mesh thanh watertight bang cach bit kin truc tiep cac chu trinh bien (boundary loops).
 
-    Vat the scan tu 1 phia (vi du: quan ao, chuot may tinh dat tren ban) cho
-    Poisson mesh ho o mat duoi. Ham nay dong kin bang:
-      - Tim boundary loop (duong vien ho cua mesh)
-      - Tao tuong ben noi boundary xuong san (y_min)
-      - Tao mat day phang bang fan triangulation
-
-    Ket qua: mesh watertight co the dung cho tai hien / in 3D.
+    Khong keo tuong gia xuong truc Y (y_floor) vi truc toa do 3D co the bi nghieng va
+    vat the tu do (chuot, coc...) se bi bien dang thanh buc tuong vach da dung dung.
     """
     if mesh.is_watertight():
         print("  mesh da watertight")
         return mesh
 
-    print("  them tuong ben + mat day de dong kin mesh...")
+    print("  dong kin mesh tai cac duong bien...")
+
+    # Don sach topology truoc khi xac dinh bien
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+
+    for _ in range(5):
+        nmv = mesh.get_non_manifold_vertices()
+        if len(nmv) == 0:
+            break
+        v_mask = np.zeros(len(mesh.vertices), dtype=bool)
+        v_mask[np.asarray(nmv)] = True
+        mesh.remove_vertices_by_mask(v_mask)
+        mesh.remove_non_manifold_edges()
+
     verts = np.asarray(mesh.vertices).copy()
     tris  = np.asarray(mesh.triangles).copy()
+    if len(tris) == 0:
+        return mesh
 
-    # --- Traverse boundary loops theo DIRECTED EDGE ---
-    # Moi tam giac (a,b,c) dong gop canh huong (a->b), (b->c), (c->a).
-    # Boundary edge: (u->v) co trong tam giac nhung (v->u) thi khong.
-    # => moi dinh boundary chi co duy nhat 1 canh di ra -> next_map[u] = v
-    directed: dict[tuple[int,int], int] = {}
+    # Xac dinh directed boundary edge: (u, v) xuat hien trong tam giac nhung (v, u) thi khong
+    directed: dict[tuple[int, int], int] = {}
     for tri in tris:
         a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        for u, v in [(a,b),(b,c),(c,a)]:
-            directed[(u,v)] = directed.get((u,v),0) + 1
-    next_map: dict[int,int] = {
-        u: v for (u,v) in directed if (v,u) not in directed
+        for u, v in [(a, b), (b, c), (c, a)]:
+            directed[(u, v)] = directed.get((u, v), 0) + 1
+
+    next_map: dict[int, int] = {
+        u: v for (u, v) in directed if (v, u) not in directed
     }
 
     if not next_map:
         print("  khong co boundary directed edge, giu nguyen mesh")
         return mesh
 
-    visited_starts: set[int] = set()
+    # Tuyen tinh cac chu trinh bien
+    remaining = dict(next_map)
     loops: list[list[int]] = []
-    for start in list(next_map.keys()):
-        if start in visited_starts:
-            continue
+    while remaining:
+        start = next(iter(remaining))
+        cur = remaining.pop(start)
         loop = [start]
-        visited_starts.add(start)
-        cur = next_map.get(start, start)
-        while cur != start and cur not in visited_starts:
+        while cur != start:
             loop.append(cur)
-            visited_starts.add(cur)
-            cur = next_map.get(cur, start)
-        loops.append(loop)
-
-    loops = [lp for lp in loops if len(lp) >= 3]  # loai loop qua ngan
-    loop_sizes = [len(lp) for lp in loops]
-    print(f"  tim thay {len(loops)} boundary loop(s): {loop_sizes}")
-
-    # --- Them tuong ben + mat day cho moi loop ---
-    # Loop lon nhat = bien gioi chinh (mat duoi ho) -> tao tuong ben + mat day phang
-    # Loop nho con lai = lo noi tai tren be mat -> fan fill tai chỗ (khong can tuong ben)
-    y_floor = float(verts[:, 1].min())
-    new_v: list[np.ndarray] = [verts]
-    new_t: list[np.ndarray] = [tris]
-    offset = len(verts)
+            if cur not in remaining:
+                break
+            cur = remaining.pop(cur)
+        if cur == start and len(loop) >= 3:
+            loops.append(loop)
 
     if not loops:
+        print("  khong co chu trinh bien khep kin hop le, giu nguyen mesh")
         return mesh
 
-    # Sap xep loop theo kich thuoc giam dan
-    loops_sorted = sorted(loops, key=len, reverse=True)
-    main_loop  = loops_sorted[0]    # loop lon nhat: mat day chinh
-    inner_loops = loops_sorted[1:]  # loop nho: lo noi tai
+    print(f"  tim thay {len(loops)} chu trinh bien: {[len(l) for l in loops]} dinh")
+    new_v = [verts]
+    new_t = [tris]
+    offset = len(verts)
 
-    # --- Xu ly main loop: tuong ben + mat day phang ---
-    def _add_floor_loop(loop: list[int]) -> None:
-        n = len(loop)
-        loop_xyz = verts[loop]
-        cap_xyz  = loop_xyz.copy()
-        cap_xyz[:, 1] = y_floor
-
-        centroid  = cap_xyz.mean(axis=0)
-        cap_start = offset
-        cent_idx  = offset + n
-
-        new_v.append(cap_xyz)
-        new_v.append(centroid[None])
-
-        # Tuong ben
-        side: list[list[int]] = []
-        for i in range(n):
-            a  = loop[i];      b  = loop[(i + 1) % n]
-            ca = cap_start + i; cb = cap_start + (i + 1) % n
-            side.append([a,  cb, ca])
-            side.append([a,  b,  cb])
-        new_t.append(np.array(side, dtype=np.int32))
-
-        # Mat day: fan tu centroid sap xep theo goc x-z
-        xz  = cap_xyz[:, [0, 2]]; cxz = centroid[[0, 2]]
-        ang = np.arctan2(xz[:, 1] - cxz[1], xz[:, 0] - cxz[0])
-        ord_ = np.argsort(ang)
-        ft: list[list[int]] = []
-        for i in range(n):
-            ci = cap_start + ord_[i]; cj = cap_start + ord_[(i + 1) % n]
-            ft.append([cent_idx, cj, ci])
-        new_t.append(np.array(ft, dtype=np.int32))
-
-    def _add_floor_loop(loop: list[int]) -> None:
-        """Tao tuong ben + mat day phang cho loop chinh (bien gioi ngoai)."""
-        nonlocal offset
-        n = len(loop)
-        loop_xyz = verts[loop]
-        cap_xyz  = loop_xyz.copy()
-        cap_xyz[:, 1] = y_floor
-        centroid  = cap_xyz.mean(axis=0)
-        cap_start = offset
-        cent_idx  = offset + n
-        new_v.append(cap_xyz)
-        new_v.append(centroid[None])
-        offset += n + 1
-        # Tuong ben (phap tuyen huong ra ngoai)
-        side: list[list[int]] = []
-        for i in range(n):
-            a=loop[i]; b=loop[(i+1)%n]; ca=cap_start+i; cb=cap_start+(i+1)%n
-            side.append([a, ca, cb])
-            side.append([a, cb, b])
-        new_t.append(np.array(side, dtype=np.int32))
-        # Mat day (phap tuyen huong xuong)
-        xz=cap_xyz[:,[0,2]]; cxz=centroid[[0,2]]
-        ang=np.arctan2(xz[:,1]-cxz[1], xz[:,0]-cxz[0])
-        ord_=np.argsort(ang)
-        ft=[[cent_idx, cap_start+ord_[(i+1)%n], cap_start+ord_[i]] for i in range(n)]
-        new_t.append(np.array(ft, dtype=np.int32))
-
-    def _add_inner_fill(loop: list[int]) -> None:
-        """Fan fill lo noi tai tren be mat (boundary directed -> winding thuan)."""
-        nonlocal offset
-        n = len(loop)
-        loop_xyz = verts[loop]
-        centroid = loop_xyz.mean(axis=0)
-        cent_idx = offset
-        new_v.append(centroid[None])
+    # Bit kin truc tiep tung chu trinh bien bang centroid fan cua chinh no (khong keo tuong gia)
+    for loop in loops:
+        k = len(loop)
+        cent = verts[loop].mean(axis=0)
+        c_idx = offset
+        new_v.append(cent[None])
         offset += 1
-        xz=loop_xyz[:,[0,2]]; cxz=centroid[[0,2]]
-        ang=np.arctan2(xz[:,1]-cxz[1], xz[:,0]-cxz[0])
-        ord_=np.argsort(ang)
-        # Winding thuan (directed boundary: u->v => tam giac [cent, u, v])
-        ft=[[cent_idx, loop[ord_[i]], loop[ord_[(i+1)%n]]] for i in range(n)]
-        new_t.append(np.array(ft, dtype=np.int32))
+        # Tam giac bit kin co huong nguoc voi huong canh bien de khau kin
+        fill_tris = [[c_idx, loop[(i + 1) % k], loop[i]] for i in range(k)]
+        new_t.append(np.array(fill_tris, dtype=np.int32))
 
-    print(f"  main loop: {len(main_loop)} dinh (tuong ben + mat day)")
-    _add_floor_loop(main_loop)
-    for il in inner_loops:
-        print(f"  inner loop: {len(il)} dinh (fan fill)")
-        _add_inner_fill(il)
-
-
-
-    # --- Gop va don sach ---
+    # Gop va don sach
     result = o3d.geometry.TriangleMesh()
     result.vertices  = o3d.utility.Vector3dVector(np.vstack(new_v))
     result.triangles = o3d.utility.Vector3iVector(np.vstack(new_t))
     result.remove_degenerate_triangles()
     result.remove_duplicated_vertices()
-    # NOTE: khong goi remove_non_manifold_edges vi se pha cac cap moi them vao
     result.compute_vertex_normals()
 
     wt = result.is_watertight()
-    print(f"  ket qua: watertight={wt}  "
-          f"{len(result.vertices):,} dinh, {len(result.triangles):,} tam giac")
-    if not wt:
-        print("  [!!] Van chua watertight (co the co loop tu giao).")
-        print("  [!!] Thu giam poisson_density_quantile hoac tang poisson_depth.")
+    print(f"  ket qua: watertight={wt}  {len(result.vertices):,} dinh, {len(result.triangles):,} tam giac")
     return result
 
 
@@ -480,12 +450,13 @@ def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMe
 # ---------------------------------------------------------------------------
 
 def _export_obj(mesh: o3d.geometry.TriangleMesh, obj_path) -> None:
+    has_colors = mesh.has_vertex_colors() and len(mesh.vertex_colors) == len(mesh.vertices)
     o3d.io.write_triangle_mesh(
         str(obj_path),
         mesh,
         write_ascii=True,
         write_vertex_normals=True,
-        write_vertex_colors=False,
+        write_vertex_colors=has_colors,
     )
 
 
@@ -546,17 +517,19 @@ def run(sample_name: str, cfg: dict) -> None:
     elif mode == "poisson":
         print("[Buoc 4] Poisson surface reconstruction...")
         mesh = _poisson_mesh(pc, e)
-        print("[Buoc 4] Dong kin mesh (watertight)...")
-        mesh = _make_watertight(mesh)
+        if e.get("make_watertight", False):
+            print("[Buoc 4] Dong kin mesh (watertight)...")
+            mesh = _make_watertight(mesh)
 
-    else:  # mode == "both": Poisson (be mat thuc) + dong kin = 1 file kín
+    else:  # mode == "both": Poisson (be mat thuc) + OBB (hop tham chieu)
         print("[Buoc 4] OBB fitting (hop tham chieu)...")
         obb = _obb_mesh(pc)
         print("[Buoc 4] Poisson surface reconstruction (be mat thuc te)...")
         poi = _poisson_mesh(pc, e)
-        print("[Buoc 4] Dong kin Poisson mesh...")
-        poi = _make_watertight(poi)
-        mesh = obb + poi   # gop OBB + Poisson watertight
+        if e.get("make_watertight", False):
+            print("[Buoc 4] Dong kin Poisson mesh...")
+            poi = _make_watertight(poi)
+        mesh = obb + poi   # gop OBB + Poisson
         mesh.compute_vertex_normals()
         print(f"  gop mesh: {len(mesh.vertices):,} dinh, {len(mesh.triangles):,} tam giac")
 
