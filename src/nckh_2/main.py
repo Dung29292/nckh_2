@@ -13,13 +13,14 @@ import sys
 from . import paths
 from .config import load_config
 from .input_source import choose_sample, list_samples, record_video
-from . import step1_blur_filter, step2_masking, step3_reconstruct, step4_mesh_export
+from . import step1_blur_filter, step2_masking, step3_reconstruct, step4_mesh_export, step5_mesh_refine
 
 STEPS = {
-    1: ("Loc frame mo",              step1_blur_filter.run),
-    2: ("Tach phong (Grounded-SAM 2)", step2_masking.run),
-    3: ("COLMAP + 3DGS",             step3_reconstruct.run),
-    4: ("Lam sach & xuat .obj",      step4_mesh_export.run),
+    1: ("Loc frame mo",                  step1_blur_filter.run),
+    2: ("Tach phong (Grounded-SAM 2)",   step2_masking.run),
+    3: ("COLMAP + 3DGS",                 step3_reconstruct.run),
+    4: ("Dung mesh khoi tao (Poisson)",  step4_mesh_export.run),
+    5: ("Tinh chinh & lam min mesh",     step5_mesh_refine.run),
 }
 
 # Buoc nao can biet nguon video / camera

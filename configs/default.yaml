@@ -35,7 +35,7 @@ reconstruction:
 
 mesh_export:         # Buoc 4
   mesh_mode: poisson            # obb (hop 6 mat) | poisson (be mat cong/phi phang) | both
-  poisson_depth: 8              # do sau luoi Poisson (8 giup bat net chi tiet vat the cong)
+  poisson_depth: 7              # 7 giup be mat cong cang tron, muot ma; tang 8 neu can chi tiet cuc nho
   poisson_density_quantile: 0.01 # 0.01 chi cat vien mo, khong bi rach lung vat the nhu 0.05
   stat_nb: 20
   stat_ratio: 2.0
@@ -44,15 +44,36 @@ mesh_export:         # Buoc 4
   cluster_eps_frac: 0.02        # ban kinh DBSCAN loc nhieu troi noi
   cluster_min_ratio: 0.12       # giu cac cum con >= 12% cum chinh, khong cat mat phan vat the
   cluster_min_points: 40
-  voxel_frac: 0.004
-  normal_radius_frac: 0.05
-  normal_nn: 30
+  voxel_frac: 0.005             # hop nhat lop diem kep tranh tao gon song
+  normal_radius_frac: 0.07      # ban kinh tinh phap tuyen em ai, tranh giat cuc bo
+  normal_nn: 40
   orient_k: 15
-  smooth_iter: 5
+  normal_smooth_iter: 2         # lam muot truong phap tuyen k-NN truoc khi dung Poisson
+  normal_smooth_k: 25
+
+  # --- Tien xu ly lam muot point cloud (MLS: Moving Least Squares) ---
+  mls_iter: 1                   # 1 vong MLS chieu diem ve tiep dien cuc bo, triet tieu ranh khia
+  mls_neighbors: 30             # so diem lang gieng fit tiep dien
+  mls_alpha: 0.75               # do em chieu diem (0.7-0.85 giu form dang nhung xoa gon song)
+
+  # --- Lam min mesh so bo tai Buoc 4 ---
+  smooth_type: "taubin"         # taubin (lam min khong teo the tich) hoac laplacian
+  smooth_iter: 30               # so vong lam min so bo (30 vong Taubin)
   smooth_lambda: 0.5
+  smooth_mu: -0.53
+  polish_iter: 3                # so vong danh bong nhe nhàng so bo
 
   # false: giu dung 100% be mat thuc te cua vat the phi phang; true: bit phang day
   make_watertight: false
 
   # --- Cat phan thua ngoai vat the (vay Poisson) ---
   poisson_hull_pad_frac: 0.03
+
+mesh_refine:             # Buoc 5: Pipeline tinh chinh & lam min chuyen sau (chay doc lap hoac tu dong)
+  auto_run: true                # tu dong chay ngay sau buoc 4
+  taubin_iter: 45               # so vong Taubin triet tieu song/ranh khong teo the tich
+  taubin_lambda: 0.5
+  taubin_mu: -0.53
+  polish_iter: 4                # so vong danh bong lam muot be mat (simple polish)
+  subdivide: false              # bat true neu can tang mat do luoi truoc khi lam min
+  subdivide_method: "midpoint"  # midpoint hoac loop

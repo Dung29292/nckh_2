@@ -156,6 +156,49 @@ def _clean(pc: o3d.geometry.PointCloud, e: dict) -> tuple[o3d.geometry.PointClou
 
 
 # ---------------------------------------------------------------------------
+# LAM MUOT POINT CLOUD (MLS - MOVING LEAST SQUARES)
+# ---------------------------------------------------------------------------
+
+def _smooth_point_cloud_mls(
+    pc: o3d.geometry.PointCloud,
+    e: dict,
+) -> o3d.geometry.PointCloud:
+    """Moving Least Squares (MLS) point cloud pre-smoothing.
+
+    Chieu diem ve tiep dien cuc bo dua tren k-lang gieng gan nhat.
+    Giup triet tieu cac lop gon song (concentric ripples / scanline steps)
+    sinh ra tu sai so do khop stereo tu nhieu goc quay camera (turntable/orbit).
+    """
+    mls_iter = int(e.get("mls_iter", 1))
+    if mls_iter <= 0 or len(pc.points) < 30:
+        return pc
+
+    k = int(e.get("mls_neighbors", 30))
+    alpha = float(e.get("mls_alpha", 0.75))
+    pts = np.asarray(pc.points)
+
+    print(f"  MLS point cloud pre-smoothing: iter={mls_iter}, k={k}, alpha={alpha}...")
+    for _ in range(mls_iter):
+        kdtree = o3d.geometry.KDTreeFlann(pc)
+        new_pts = pts.copy()
+        for i in range(len(pts)):
+            _, idxs, _ = kdtree.search_knn_vector_3d(pts[i], k)
+            cluster = pts[idxs]
+            cent = cluster.mean(axis=0)
+            centered = cluster - cent
+            cov = centered.T @ centered
+            vals, vecs = np.linalg.eigh(cov)
+            normal = vecs[:, 0]
+            proj = pts[i] - np.dot(pts[i] - cent, normal) * normal
+            new_pts[i] = (1.0 - alpha) * pts[i] + alpha * proj
+        pts = new_pts
+        pc.points = o3d.utility.Vector3dVector(pts)
+
+    print(f"  MLS hoan tat: da lam muot {len(pts):,} diem tren be mat point cloud.")
+    return pc
+
+
+# ---------------------------------------------------------------------------
 # PHAP TUYEN
 # ---------------------------------------------------------------------------
 
@@ -205,6 +248,24 @@ def _compute_normals(
     lengths  = np.linalg.norm(n_blend, axis=1, keepdims=True)
     lengths  = np.where(lengths < 1e-8, 1.0, lengths)
     n_final  = n_blend / lengths
+
+    # Lam muot truong phap tuyen bang k-NN de loai bo gon song (ripples) tren be mat
+    normal_smooth_iter = int(e.get("normal_smooth_iter", 2))
+    if normal_smooth_iter > 0 and len(pc.points) > 20:
+        kdtree = o3d.geometry.KDTreeFlann(pc)
+        k_neighbors = min(int(e.get("normal_smooth_k", 20)), len(pc.points))
+        pts_arr = np.asarray(pc.points)
+        n_smooth = n_final.copy()
+        for _ in range(normal_smooth_iter):
+            n_next = np.zeros_like(n_smooth)
+            for idx in range(len(pts_arr)):
+                _, idxs, _ = kdtree.search_knn_vector_3d(pts_arr[idx], k_neighbors)
+                avg_n = n_smooth[idxs].mean(axis=0)
+                norm = np.linalg.norm(avg_n)
+                n_next[idx] = avg_n / (norm if norm > 1e-8 else 1.0)
+            n_smooth = n_next
+        n_final = n_smooth
+        print(f"  lam muot phap tuyen k-NN: iter={normal_smooth_iter} k={k_neighbors}")
 
     pc.normals = o3d.utility.Vector3dVector(n_final)
 
@@ -310,15 +371,33 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
         print(f"  giu thanh phan lon nhat: {len(n_tris_per_cluster)} manh, "
               f"{before_t:,} -> {len(mesh.triangles):,} tam giac")
 
-    # --- Laplacian smoothing: lam min duong cong be mat cho vat the phi phang ---
-    n_iter = int(e.get("smooth_iter", 5))
+    # --- Mesh smoothing: lam min duong cong be mat, triet tieu gon song (ripples) ---
+    smooth_type = e.get("smooth_type", "taubin").lower()
+    n_iter = int(e.get("smooth_iter", 30))
     lam    = float(e.get("smooth_lambda", 0.5))
+    mu     = float(e.get("smooth_mu", -0.53))
+
     if n_iter > 0:
-        mesh = mesh.filter_smooth_laplacian(
-            number_of_iterations=n_iter,
-            lambda_filter=lam,
-        )
-        print(f"  Laplacian smooth: iter={n_iter} lambda={lam}")
+        if smooth_type == "taubin":
+            # Taubin smoothing khong lam teo nho (shrinkage) the tich vat the
+            mesh = mesh.filter_smooth_taubin(
+                number_of_iterations=n_iter,
+                lambda_filter=lam,
+                mu=mu,
+            )
+            print(f"  Taubin smooth: iter={n_iter} lambda={lam} mu={mu}")
+        else:
+            mesh = mesh.filter_smooth_laplacian(
+                number_of_iterations=n_iter,
+                lambda_filter=lam,
+            )
+            print(f"  Laplacian smooth: iter={n_iter} lambda={lam}")
+
+    # Giai doan 2: Gentle surface polish (danh bong be mat)
+    polish_iter = int(e.get("polish_iter", 3))
+    if polish_iter > 0:
+        mesh = mesh.filter_smooth_simple(number_of_iterations=polish_iter)
+        print(f"  Simple polish: iter={polish_iter}")
 
     # Chuyen mau tu point cloud goc sang mesh vertices neu co mau
     if pc.has_colors() and len(pc.colors) > 0 and len(mesh.vertices) > 0:
@@ -495,6 +574,11 @@ def run(sample_name: str, cfg: dict) -> None:
         pc = pc.select_by_index(keep)
         print(f"  cat nen: loai {len(pts)-len(keep):,} diem duoi y={threshold:.4f}")
 
+    # --- MLS Point Cloud Pre-smoothing (triet tieu gon song toa do tu camera) ---
+    if e.get("mls_iter", 1) > 0 and len(pc.points) > 30:
+        print("[Buoc 4] Lam muot toa do diem (MLS)...")
+        pc = _smooth_point_cloud_mls(pc, e)
+
     # Luu point cloud sach de debug trong Blender
     clean_ply = out_dir / "point_cloud_clean.ply"
     o3d.io.write_point_cloud(str(clean_ply), pc)
@@ -533,8 +617,20 @@ def run(sample_name: str, cfg: dict) -> None:
         mesh.compute_vertex_normals()
         print(f"  gop mesh: {len(mesh.vertices):,} dinh, {len(mesh.triangles):,} tam giac")
 
-    # --- Xuat ---
+    # --- Xuat ban dung khoi tao ---
     print(f"[Buoc 4] Xuat {obj_path.name}...")
     _export_obj(mesh, obj_path)
     print(f"[Buoc 4] Xong -> {obj_path}  ({obj_path.stat().st_size/1024:.1f} KB)")
-    print(f"  Blender: File > Import > Wavefront (.obj) > {obj_path.name}")
+
+    # Luu ban goc raw truoc khi tinh chinh de de dang so sanh A/B trong Blender
+    raw_path = out_dir / f"{sample_name}_raw.obj"
+    import shutil
+    shutil.copyfile(str(obj_path), str(raw_path))
+    print(f"  da luu ban goc -> {raw_path.name}")
+
+    # Tu dong goi Buoc 5 (Mesh Refine Pipeline) neu duoc bat
+    if cfg.get("mesh_refine", {}).get("auto_run", True):
+        from . import step5_mesh_refine
+        step5_mesh_refine.run(sample_name, cfg)
+    else:
+        print(f"  Blender: File > Import > Wavefront (.obj) > {obj_path.name}")

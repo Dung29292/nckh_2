@@ -54,6 +54,7 @@ data/processed/**
 # Outputs
 outputs/**
 !outputs/.gitkeep
+scratch
 
 # Pretrained / trained / fine-tuned weights (bat ky cap nao)
 models/**
