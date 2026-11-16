@@ -42,9 +42,18 @@ def refine_mesh(mesh: o3d.geometry.TriangleMesh, r_cfg: dict) -> o3d.geometry.Tr
         print(f"  Subdivide ({s_method}): {before_v:,} -> {len(mesh.vertices):,} dinh")
 
     # --- Giai doan 2: Taubin Smoothing (khong co cum the tich) ---
+    mesh.compute_triangle_normals()
+    tri_norms = np.asarray(mesh.triangle_normals)
+    is_box_mesh = len(tri_norms) > 0 and float(np.mean(np.max(np.abs(tri_norms), axis=1) > 0.94)) > 0.70
+
     taubin_iter = int(r_cfg.get("taubin_iter", 45))
     t_lam = float(r_cfg.get("taubin_lambda", 0.5))
     t_mu = float(r_cfg.get("taubin_mu", -0.53))
+    polish_iter = int(r_cfg.get("polish_iter", 4))
+
+    if is_box_mesh:
+        taubin_iter = min(taubin_iter, 3)
+        polish_iter = 0
 
     if taubin_iter > 0:
         mesh = mesh.filter_smooth_taubin(
@@ -55,12 +64,19 @@ def refine_mesh(mesh: o3d.geometry.TriangleMesh, r_cfg: dict) -> o3d.geometry.Tr
         print(f"  Taubin smoothing: {taubin_iter} vong (lambda={t_lam}, mu={t_mu})")
 
     # --- Giai doan 3: Polish (lam muot be mat) ---
-    polish_iter = int(r_cfg.get("polish_iter", 4))
     if polish_iter > 0:
         mesh = mesh.filter_smooth_simple(number_of_iterations=polish_iter)
         print(f"  Surface polish: {polish_iter} vong")
 
-    # --- Giai doan 4: Phap tuyen & Mau sac ---
+    # --- Giai doan 4: Can truc va tiep xuc mat san Z=0 ---
+    if r_cfg.get("align_upright", True):
+        verts = np.asarray(mesh.vertices)
+        z_min = verts[:, 2].min()
+        if abs(z_min) > 1e-4:
+            verts[:, 2] -= z_min
+            mesh.vertices = o3d.utility.Vector3dVector(verts)
+
+    # --- Giai doan 5: Phap tuyen & Mau sac ---
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
     mesh.compute_triangle_normals()
@@ -92,6 +108,13 @@ def run(sample_name: str, cfg: dict) -> None:
     n_v = len(mesh.vertices)
     n_t = len(mesh.triangles)
     print(f"  ban dau: {n_v:,} dinh, {n_t:,} tam giac")
+
+    # Can thang dung vat the (Z-up), nam ngang phang tren san (Z=0) va can tam (X=0, Y=0)
+    if r_cfg.get("align_upright", True) and len(mesh.vertices) > 0:
+        from .step4_mesh_export import _align_upright_and_ground
+        mesh = _align_upright_and_ground(mesh)
+        has_colors = mesh.has_vertex_colors() and len(mesh.vertex_colors) == len(mesh.vertices)
+        o3d.io.write_triangle_mesh(str(raw_obj), mesh, write_ascii=True, write_vertex_normals=True, write_vertex_colors=has_colors)
 
     t0 = time.time()
     mesh_refined = refine_mesh(mesh, r_cfg)

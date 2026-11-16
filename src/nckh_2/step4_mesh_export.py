@@ -156,6 +156,59 @@ def _clean(pc: o3d.geometry.PointCloud, e: dict) -> tuple[o3d.geometry.PointClou
 
 
 # ---------------------------------------------------------------------------
+# LOC MAT PHANG SAN / BAN XOAY (RANSAC PLANE SEGMENTATION)
+# ---------------------------------------------------------------------------
+
+def _remove_plane_ransac(
+    pc: o3d.geometry.PointCloud,
+    diag: float,
+    e: dict,
+) -> o3d.geometry.PointCloud:
+    """Tu dong phat hien va loai bo mat phang san / de ban xoay bang RANSAC.
+
+    Giup nguoi dung thoai mai dat de hoa van tren ban xoay de dinh vi camera 360 do,
+    ma van tu dong tach sach san de khoi vat the o Buoc 4 ma khong chem cheo than vat.
+    """
+    if not e.get("remove_table_plane", True) or len(pc.points) < 100:
+        return pc
+
+    dist_thresh = float(e.get("plane_dist_threshold_frac", 0.012)) * diag
+    dist_thresh = max(dist_thresh, 0.002)
+
+    try:
+        plane_model, inliers = pc.segment_plane(
+            distance_threshold=dist_thresh,
+            ransac_n=3,
+            num_iterations=1000,
+        )
+    except Exception:
+        return pc
+
+    n_plane = len(inliers)
+    n_total = len(pc.points)
+    ratio = n_plane / max(n_total, 1)
+
+    # Chi xoa neu mat phang chiem tu 5% den 65% so diem va nam o phan day/bien
+    if 0.05 <= ratio <= 0.65:
+        pts = np.asarray(pc.points)
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        n_len = np.linalg.norm(normal)
+        if n_len > 1e-8:
+            normal = normal / n_len
+            dists = np.dot(pts, normal) + (d / n_len)
+            pos_ratio = np.mean(dists > dist_thresh)
+            neg_ratio = np.mean(dists < -dist_thresh)
+
+            if max(pos_ratio, neg_ratio) > 0.60:
+                pc_clean = pc.select_by_index(inliers, invert=True)
+                print(f"  RANSAC Plane: da loai bo {n_plane:,}/{n_total:,} diem ({ratio:.1%}) thuoc mat san/ban xoay")
+                return pc_clean
+
+    return pc
+
+
+# ---------------------------------------------------------------------------
 # LAM MUOT POINT CLOUD (MLS - MOVING LEAST SQUARES)
 # ---------------------------------------------------------------------------
 
@@ -524,6 +577,475 @@ def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMe
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# NOI SUY HINH HOC 3D CHO VAT THE KHUYET MAT (BOX 6 MAT & HINH TRU 360 DO)
+# ---------------------------------------------------------------------------
+
+def _build_colored_box_mesh(
+    W: float,
+    D: float,
+    H: float,
+    pc_interp: o3d.geometry.PointCloud,
+    subdiv_step: float,
+) -> o3d.geometry.TriangleMesh:
+    """Tao mesh hop 6 mat kin (watertight) mat do cao, giu nguyen mau sac & hoa tiet that tren cac mat."""
+    nx = max(12, int(round(W / subdiv_step)))
+    ny = max(12, int(round(D / subdiv_step)))
+    nz = max(10, int(round(H / subdiv_step)))
+
+    # Dung mesh hop chuan cua Open3D roi subdivide de giu topology watertight 100%
+    box = o3d.geometry.TriangleMesh.create_box(width=W, height=D, depth=H)
+    box.translate([-W / 2.0, -D / 2.0, 0.0])
+    # Subdivide midpoint 5 lan (12 -> 48 -> 192 -> 768 -> 3072 -> 12288 tam giac)
+    box = box.subdivide_midpoint(number_of_iterations=5)
+    box.remove_duplicated_vertices()
+    box.remove_degenerate_triangles()
+
+    # Gan mau tu point cloud da noi suy sang tung dinh mesh
+    if pc_interp.has_colors() and len(pc_interp.points) > 0:
+        kdtree = o3d.geometry.KDTreeFlann(pc_interp)
+        pc_cols = np.asarray(pc_interp.colors)
+        verts = np.asarray(box.vertices)
+        v_cols = np.zeros_like(verts)
+        for i, v in enumerate(verts):
+            _, idxs, dists = kdtree.search_knn_vector_3d(v, 3)
+            w = 1.0 / (np.sqrt(dists) + 1e-5)
+            w /= w.sum()
+            v_cols[i] = (pc_cols[idxs] * w[:, None]).sum(axis=0)
+        box.vertex_colors = o3d.utility.Vector3dVector(v_cols)
+
+    # Lam mem nhe canh sac (bevel tu nhien) ma van giu phang 6 mat
+    box = box.filter_smooth_taubin(number_of_iterations=3, lambda_filter=0.45, mu=-0.48)
+    verts = np.asarray(box.vertices)
+    verts[:, 2] -= verts[:, 2].min()
+    box.vertices = o3d.utility.Vector3dVector(verts)
+    box.compute_triangle_normals()
+    box.compute_vertex_normals()
+    return box
+
+
+def _complete_box_geometry(
+    pc: o3d.geometry.PointCloud,
+    e: dict,
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.TriangleMesh]:
+    """Noi suy 6 mat hinh hop chu nhat tu point cloud bi khuyet mat (chi thay 2-3 mat).
+
+    Thuat toan:
+      1. Loai bo diem mau la (nhu vien sach xanh ben duoi neu sot lai).
+      2. Sequential Orthogonal RANSAC: tim 2 mat phang vuong goc chu dao (Mat tren + Mat truoc)
+         de khoi phuc he truc toa do truc giao (X, Y, Z) chinh xac tuyet doi cua chiec hop.
+      3. Xac dinh kich thuoc that (W, D, H) tu phan vi inliers cua cac mat phang.
+      4. Noi suy luoi diem 3D day du cho ca 6 mat (Mat tren, Mat day, Mat truoc, Mat sau doi xung,
+         Mat trai, Mat phai) kem noi suy mau RGB k-NN giu nguyen chu/hoa van tren hop.
+      5. Tao dong thoi point_cloud_clean.ply (du 6 mat) va mesh hop 6 mat watertight.
+    """
+    pts = np.asarray(pc.points)
+    cols = np.asarray(pc.colors) if pc.has_colors() else np.full_like(pts, 0.25)
+
+    # Loc bo diem vien sach mau xanh cyan (ke ca vung bong ram) neu bi lan o mep duoi
+    is_cyan = (
+        (cols[:, 2] > cols[:, 0] * 1.12)
+        & (cols[:, 1] > cols[:, 0] * 1.12)
+        & ((cols[:, 2] - cols[:, 0]) > 0.05)
+    )
+    if np.mean(~is_cyan) > 0.35 and np.any(is_cyan):
+        n_cyan = int(np.sum(is_cyan))
+        pc = pc.select_by_index(np.nonzero(~is_cyan)[0])
+        print(f"  [Noi suy Hop] Loc bo {n_cyan:,} diem mau nen/sach lan o bien")
+
+    pc, _ = pc.remove_statistical_outlier(nb_neighbors=25, std_ratio=1.8)
+    pts = np.asarray(pc.points)
+    cols = np.asarray(pc.colors) if pc.has_colors() else np.full_like(pts, 0.25)
+    diag = float(np.linalg.norm(np.percentile(pts, 95, axis=0) - np.percentile(pts, 5, axis=0)))
+
+    # Buoc 1: RANSAC tim mat phang lon nhat (Mat nap tren)
+    p1_model, inliers1 = pc.segment_plane(distance_threshold=0.015 * diag, ransac_n=3, num_iterations=2000)
+    n1 = np.array(p1_model[:3], dtype=np.float64)
+    n1 /= np.linalg.norm(n1)
+
+    # Buoc 2: RANSAC tim mat phang vuong goc thu hai (Mat dung truoc)
+    rem_pc = pc.select_by_index(inliers1, invert=True)
+    if len(rem_pc.points) >= 50:
+        p2_model, inliers2 = rem_pc.segment_plane(distance_threshold=0.015 * diag, ransac_n=3, num_iterations=2000)
+        n2_raw = np.array(p2_model[:3], dtype=np.float64)
+    else:
+        # Fallback PCA neu chi co 1 mat
+        _, eigvecs = np.linalg.eigh(np.cov(pts - pts.mean(axis=0), rowvar=False))
+        n2_raw = eigvecs[:, 1]
+        inliers2 = list(range(len(rem_pc.points)))
+
+    # Truc giao hoa n2 vuong goc 90 do voi n1
+    n2 = n2_raw - np.dot(n2_raw, n1) * n1
+    n2_norm = np.linalg.norm(n2)
+    if n2_norm < 1e-6:
+        _, eigvecs = np.linalg.eigh(np.cov(pts - pts.mean(axis=0), rowvar=False))
+        n2 = eigvecs[:, 1] - np.dot(eigvecs[:, 1], n1) * n1
+        n2_norm = np.linalg.norm(n2)
+    n2 /= n2_norm
+    n3 = np.cross(n1, n2)
+    n3 /= np.linalg.norm(n3)
+
+    R = np.vstack([n3, n2, n1])
+    p_ortho = (R @ pts.T).T
+
+    # Dinh huong +Z cho mat nap tren va -Y cho mat truoc
+    if np.median(p_ortho[inliers1, 2]) < np.median(p_ortho[:, 2]):
+        R[2] *= -1
+        p_ortho[:, 2] *= -1
+    rem_ortho = np.delete(p_ortho, inliers1, axis=0)
+    if len(rem_ortho) > 0 and len(inliers2) > 0:
+        if np.median(rem_ortho[inliers2, 1]) > np.median(p_ortho[:, 1]):
+            R[1] *= -1
+            p_ortho[:, 1] *= -1
+    if np.linalg.det(R) < 0:
+        R[0] *= -1
+        p_ortho[:, 0] *= -1
+
+    # Xac dinh kich thuoc hop (W, D, H) trong he truc truc giao
+    z_max = float(np.median(p_ortho[inliers1, 2]))
+    z_min = float(np.percentile(rem_ortho[:, 2], 3)) if len(rem_ortho) > 10 else float(np.percentile(p_ortho[:, 2], 2))
+    y_min = float(np.median(rem_ortho[inliers2, 1])) if len(rem_ortho) > 10 and len(inliers2) > 10 else float(np.percentile(p_ortho[:, 1], 2))
+    y_max = float(np.percentile(p_ortho[inliers1, 1], 97))
+    x_min = float(np.percentile(p_ortho[:, 0], 2))
+    x_max = float(np.percentile(p_ortho[:, 0], 98))
+
+    cx = (x_min + x_max) / 2.0
+    cy = (y_min + y_max) / 2.0
+    W = max(0.1, x_max - x_min)
+    D = max(0.1, y_max - y_min)
+    H = max(0.1, z_max - z_min)
+
+    p_ortho[:, 0] -= cx
+    p_ortho[:, 1] -= cy
+    p_ortho[:, 2] -= z_min
+
+    base_color = np.median(cols[inliers1], axis=0)
+
+    in_bounds = (
+        (p_ortho[:, 0] >= -W / 2 - 0.05 * W) & (p_ortho[:, 0] <= W / 2 + 0.05 * W) &
+        (p_ortho[:, 1] >= -D / 2 - 0.05 * D) & (p_ortho[:, 1] <= D / 2 + 0.05 * D) &
+        (p_ortho[:, 2] >= -0.05 * H) & (p_ortho[:, 2] <= H + 0.05 * H)
+    )
+    p_real = np.clip(p_ortho[in_bounds], [-W / 2, -D / 2, 0.0], [W / 2, D / 2, H])
+    c_real = cols[in_bounds]
+
+    top_mask = p_real[:, 2] > 0.85 * H
+    front_mask = (~top_mask) & (p_real[:, 1] < -0.30 * D)
+    p_real[top_mask, 2] = H
+    p_real[front_mask, 1] = -D / 2.0
+
+    step = W / 65.0
+    xs = np.linspace(-W / 2, W / 2, max(12, int(round(W / step))))
+    ys = np.linspace(-D / 2, D / 2, max(12, int(round(D / step))))
+    zs = np.linspace(0.0, H, max(10, int(round(H / step))))
+
+    pc_real = o3d.geometry.PointCloud()
+    pc_real.points = o3d.utility.Vector3dVector(p_real)
+    pc_real.colors = o3d.utility.Vector3dVector(c_real)
+    kdtree = o3d.geometry.KDTreeFlann(pc_real)
+
+    interp_pts, interp_cols, interp_norms = [], [], []
+
+    def _add_face(u_vals, v_vals, make_xyz, normal_vec, mirror_front=False):
+        uu, vv = np.meshgrid(u_vals, v_vals, indexing="ij")
+        f_pts = make_xyz(uu.ravel(), vv.ravel())
+        f_cols = np.tile(base_color, (len(f_pts), 1))
+        for idx_p, pt in enumerate(f_pts):
+            q_pt = np.array([pt[0], -D / 2.0, pt[2]]) if mirror_front else pt
+            _, idxs, dists = kdtree.search_knn_vector_3d(q_pt, 3)
+            if len(dists) > 0 and dists[0] < (step * 2.5) ** 2:
+                w_knn = 1.0 / (np.sqrt(dists) + 1e-5)
+                w_knn /= w_knn.sum()
+                f_cols[idx_p] = (c_real[idxs] * w_knn[:, None]).sum(axis=0)
+        interp_pts.append(f_pts)
+        interp_cols.append(f_cols)
+        interp_norms.append(np.tile(normal_vec, (len(f_pts), 1)))
+
+    _add_face(xs, ys, lambda u, v: np.column_stack([u, v, np.full_like(u, H)]), [0, 0, 1])
+    _add_face(xs, ys, lambda u, v: np.column_stack([u, v, np.zeros_like(u)]), [0, 0, -1])
+    _add_face(xs, zs, lambda u, v: np.column_stack([u, np.full_like(u, -D / 2), v]), [0, -1, 0])
+    _add_face(xs, zs, lambda u, v: np.column_stack([u, np.full_like(u, D / 2), v]), [0, 1, 0], mirror_front=True)
+    _add_face(ys, zs, lambda u, v: np.column_stack([np.full_like(u, -W / 2), u, v]), [-1, 0, 0])
+    _add_face(ys, zs, lambda u, v: np.column_stack([np.full_like(u, W / 2), u, v]), [1, 0, 0])
+
+    pc_out = o3d.geometry.PointCloud()
+    pc_out.points = o3d.utility.Vector3dVector(np.vstack(interp_pts))
+    pc_out.colors = o3d.utility.Vector3dVector(np.vstack(interp_cols))
+    pc_out.normals = o3d.utility.Vector3dVector(np.vstack(interp_norms))
+
+    mesh_out = _build_colored_box_mesh(W, D, H, pc_out, step)
+    print(
+        f"  [Noi suy Hop 6 mat] Kich thuoc: W={W:.2f} x D={D:.2f} x H={H:.2f} | "
+        f"PointCloud={len(pc_out.points):,} diem | Mesh={len(mesh_out.vertices):,} dinh (watertight={mesh_out.is_watertight()})"
+    )
+    return pc_out, mesh_out
+
+
+def _complete_cylinder_geometry(
+    pc: o3d.geometry.PointCloud,
+    e: dict,
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.TriangleMesh]:
+    """Noi suy doi xung tron xoay 360 do cho vat the hinh tru (lo, chai, coc) khi chi quet duoc 1 goc cung."""
+    pts_init = np.asarray(pc.points)
+    diag = float(np.linalg.norm(np.percentile(pts_init, 95, axis=0) - np.percentile(pts_init, 5, axis=0)))
+    labels = np.array(pc.cluster_dbscan(eps=max(0.025 * diag, 0.01), min_points=40, print_progress=False))
+    if len(labels) > 0 and np.any(labels >= 0):
+        counts = np.bincount(labels[labels >= 0])
+        largest = int(np.argmax(counts))
+        pc = pc.select_by_index(np.nonzero(labels == largest)[0])
+
+    pts = np.asarray(pc.points)
+    cols = np.asarray(pc.colors) if pc.has_colors() else np.full_like(pts, 0.5)
+
+    cent = pts.mean(axis=0)
+    centered = pts - cent
+    _, v = np.linalg.eigh(np.cov(centered, rowvar=False))
+    # Truc lon nhat v[:, 2] la chieu cao Z; v[:, 1] la chieu ngang X; v[:, 0] la chieu sau Y
+    R = np.vstack([v[:, 1], v[:, 0], v[:, 2]])
+    if np.linalg.det(R) < 0:
+        R[0] *= -1
+    p_loc = (R @ centered.T).T
+
+    z_min, z_max = np.percentile(p_loc[:, 2], [2, 98])
+    H = max(0.1, float(z_max - z_min))
+    p_loc[:, 2] = np.clip(p_loc[:, 2] - z_min, 0.0, H)
+
+    # Dinh huong dau hep (nap lo/co chai) len phia +Z
+    bot_pts = p_loc[p_loc[:, 2] < 0.30 * H, 0]
+    top_pts = p_loc[p_loc[:, 2] > 0.70 * H, 0]
+    if len(bot_pts) > 10 and len(top_pts) > 10 and np.ptp(top_pts) > np.ptp(bot_pts):
+        p_loc[:, 2] = H - p_loc[:, 2]
+        p_loc[:, 0] *= -1
+
+    # Can tam X theo tung lat cat Z va tinh ban kinh r(z)
+    n_z = 60
+    z_bins = np.linspace(0.0, H, n_z + 1)
+    z_centers = 0.5 * (z_bins[:-1] + z_bins[1:])
+    radii = np.zeros(n_z, dtype=np.float64)
+    z_colors = np.zeros((n_z, 3), dtype=np.float64)
+    base_col = np.median(cols, axis=0)
+
+    for i in range(n_z):
+        mask = (p_loc[:, 2] >= z_bins[i]) & (p_loc[:, 2] < z_bins[i + 1])
+        if np.sum(mask) >= 5:
+            x_slice = p_loc[mask, 0]
+            radii[i] = 0.5 * float(np.percentile(x_slice, 95) - np.percentile(x_slice, 5))
+            z_colors[i] = np.median(cols[mask], axis=0)
+        else:
+            radii[i] = np.nan
+            z_colors[i] = base_col
+
+    valid = ~np.isnan(radii)
+    if np.any(valid):
+        radii = np.interp(z_centers, z_centers[valid], radii[valid])
+    else:
+        radii[:] = 1.0
+
+    # Chuan hoa hinh dang than tru + co + nap lo (tranh bi thắt eo gia do thieu diem o day)
+    r_body = float(np.percentile(radii[: int(0.75 * n_z)], 75))
+    r_cap = float(np.median(radii[int(0.80 * n_z) :]))
+    r_cap = np.clip(r_cap, 0.55 * r_body, 0.95 * r_body)
+    for i, zc in enumerate(z_centers):
+        zf = zc / H
+        if zf < 0.72:
+            radii[i] = 0.75 * r_body + 0.25 * max(radii[i], 0.85 * r_body)
+        elif zf < 0.82:
+            t_sh = (zf - 0.72) / 0.10
+            target_r = (1.0 - t_sh) * r_body + t_sh * r_cap
+            radii[i] = 0.7 * target_r + 0.3 * radii[i]
+        else:
+            radii[i] = 0.8 * r_cap + 0.2 * max(radii[i], 0.7 * r_cap)
+
+    kernel = np.ones(5) / 5.0
+    radii = np.convolve(np.pad(radii, (2, 2), mode="edge"), kernel, mode="valid")
+    radii = np.maximum(radii, 0.05 * H)
+
+    # Quay 360 do quanh truc Z tao luoi dinh va tam giac watertight
+    n_theta = 72
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+
+    verts, v_cols, norms = [], [], []
+    for iz, (zc, rc) in enumerate(zip(z_centers, radii)):
+        for th in thetas:
+            cs, sn = np.cos(th), np.sin(th)
+            verts.append([rc * cs, rc * sn, zc])
+            v_cols.append(z_colors[iz])
+            norms.append([cs, sn, 0.0])
+
+    # Them tam day (z=0) va tam dinh (z=H) de dong kin watertight
+    idx_bot_center = len(verts)
+    verts.append([0.0, 0.0, float(z_centers[0])])
+    v_cols.append(z_colors[0])
+    norms.append([0.0, 0.0, -1.0])
+
+    idx_top_center = len(verts)
+    verts.append([0.0, 0.0, float(z_centers[-1])])
+    v_cols.append(z_colors[-1])
+    norms.append([0.0, 0.0, 1.0])
+
+    tris = []
+    for iz in range(n_z - 1):
+        row0 = iz * n_theta
+        row1 = (iz + 1) * n_theta
+        for it in range(n_theta):
+            it_next = (it + 1) % n_theta
+            v00 = row0 + it
+            v01 = row0 + it_next
+            v10 = row1 + it
+            v11 = row1 + it_next
+            tris.append([v00, v01, v11])
+            tris.append([v00, v11, v10])
+
+    # Dong nap day va nap dinh
+    for it in range(n_theta):
+        it_next = (it + 1) % n_theta
+        tris.append([idx_bot_center, it_next, it])
+        top_row = (n_z - 1) * n_theta
+        tris.append([idx_top_center, top_row + it, top_row + it_next])
+
+    verts_arr = np.array(verts, dtype=np.float64)
+    verts_arr[:, 2] -= verts_arr[:, 2].min()
+    cols_arr = np.array(v_cols, dtype=np.float64)
+    norms_arr = np.array(norms, dtype=np.float64)
+
+    pc_out = o3d.geometry.PointCloud()
+    pc_out.points = o3d.utility.Vector3dVector(verts_arr)
+    pc_out.colors = o3d.utility.Vector3dVector(cols_arr)
+    pc_out.normals = o3d.utility.Vector3dVector(norms_arr)
+
+    mesh_out = o3d.geometry.TriangleMesh()
+    mesh_out.vertices = o3d.utility.Vector3dVector(verts_arr)
+    mesh_out.triangles = o3d.utility.Vector3iVector(np.array(tris, dtype=np.int32))
+    mesh_out.vertex_colors = o3d.utility.Vector3dVector(cols_arr)
+    mesh_out = mesh_out.filter_smooth_taubin(number_of_iterations=10, lambda_filter=0.5, mu=-0.53)
+    mesh_out.compute_triangle_normals()
+    mesh_out.compute_vertex_normals()
+
+    print(
+        f"  [Noi suy Hinh tru 360°] Ban kinh tb={radii.mean():.2f}, Cao H={H:.2f} | "
+        f"PointCloud={len(verts_arr):,} diem | Mesh={len(mesh_out.vertices):,} dinh (watertight={mesh_out.is_watertight()})"
+    )
+    return pc_out, mesh_out
+
+
+# ---------------------------------------------------------------------------
+# CAN THANG TRUC & DAT LEN MAT SAN (AUTO-UPRIGHT & GROUNDING)
+# ---------------------------------------------------------------------------
+
+def _align_upright_and_ground(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """Can thang dung vat the (Z-up), nam ngang phang tren san (Z=0) va can tam (X=0, Y=0)."""
+    verts = np.asarray(mesh.vertices)
+    if len(verts) == 0:
+        return mesh
+
+    # Neu mesh da duoc can thang truc (vi du tu buoc noi suy hop 6 mat hoac hinh tru 360),
+    # chi can dam bao tam X=0, Y=0 va sat san Z=0 ma khong xoay lech truc!
+    mesh.compute_triangle_normals()
+    tri_norms = np.asarray(mesh.triangle_normals)
+    already_grounded = (
+        abs(float(verts[:, 2].min())) < 1e-2
+        and abs(float(verts[:, 0].mean())) < 5e-2
+        and abs(float(verts[:, 1].mean())) < 5e-2
+    )
+    if len(tri_norms) > 0:
+        axis_aligned_ratio = float(np.mean(np.max(np.abs(tri_norms), axis=1) > 0.94))
+        if axis_aligned_ratio > 0.70 or already_grounded:
+            v_fixed = verts.copy()
+            v_fixed[:, 0] -= 0.5 * (v_fixed[:, 0].min() + v_fixed[:, 0].max())
+            v_fixed[:, 1] -= 0.5 * (v_fixed[:, 1].min() + v_fixed[:, 1].max())
+            v_fixed[:, 2] -= v_fixed[:, 2].min()
+            mesh.vertices = o3d.utility.Vector3dVector(v_fixed)
+            mesh.compute_triangle_normals()
+            mesh.compute_vertex_normals()
+            print(
+                f"  [Can truc PCA] Giu nguyen he truc da can chuan: "
+                f"X={v_fixed[:, 0].ptp():.2f}, Y={v_fixed[:, 1].ptp():.2f}, Z={v_fixed[:, 2].max():.2f} (sat san Z=0)"
+            )
+            return mesh
+
+    m_cent = verts.mean(axis=0)
+    centered = verts - m_cent
+
+    cov = np.cov(centered, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+
+    # eigh sap xep tri rieng tang dan:
+    # Kiem tra vat the tron xoay/hinh tru dung (lo, chai, coc) vs vat the nam ngang (chuot, hop dep):
+    # O vat the tron xoay dung: 2 truc tiet dien ngang xap xi nhau (eigvals[0] ≈ eigvals[1]),
+    # con truc cao (Z) la truc doi xung (thuong la truc lon nhat eigvecs[:, 2]).
+    ratio_01 = float(eigvals[1] / max(eigvals[0], 1e-8))
+    ratio_12 = float(eigvals[2] / max(eigvals[1], 1e-8))
+
+    is_upright_cylinder = (ratio_01 < 1.35 and ratio_12 > 1.25)
+
+    if is_upright_cylinder:
+        # Dang hinh tru dung: truc lon nhat la chieu cao dung (Z)
+        u_h = eigvecs[:, 2].copy()
+        u_w = eigvecs[:, 0].copy()
+        u_l = eigvecs[:, 1].copy()
+    else:
+        # Dang nam ngang (chuot, hop): truc nho nhat la chieu cao dung (Z)
+        u_h = eigvecs[:, 0].copy()
+        u_w = eigvecs[:, 1].copy()
+        u_l = eigvecs[:, 2].copy()
+
+    # 1. Xac dinh huong UP (huong len vom cong/nap tren)
+    mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals)
+    h_coords = np.dot(centered, u_h)
+    n_dot_h = np.dot(normals, u_h)
+
+    # 20% dinh tren cao nhat cua vom cong phai co phap tuyen huong ra ngoai cung chieu UP
+    top_mask = h_coords > np.percentile(h_coords, 80)
+    if n_dot_h[top_mask].mean() < 0:
+        u_h = -u_h
+
+    # 2. Xac dinh chieu dai (Y):
+    if not is_upright_cylinder:
+        # Dau chuot (phim bam) thuong hep hon duoi chuot (long ban tay)
+        l_coords = np.dot(centered, u_l)
+        w_coords = np.dot(centered, u_w)
+        l_min, l_max = l_coords.min(), l_coords.max()
+        pts_neg_l = w_coords[l_coords < l_min + 0.3 * (l_max - l_min)]
+        pts_pos_l = w_coords[l_coords > l_max - 0.3 * (l_max - l_min)]
+
+        w_neg = pts_neg_l.ptp() if len(pts_neg_l) > 0 else 0
+        w_pos = pts_pos_l.ptp() if len(pts_pos_l) > 0 else 0
+
+        # Chuan hoa: dau chuot huong ve -Y (phim bam), duoi chuot huong ve +Y
+        if w_pos < w_neg:
+            u_l = -u_l
+
+    # 3. Truc ngang (X) tao he truc toa do ban tay phai: X = Y x Z
+    u_w = np.cross(u_l, u_h)
+    u_w = u_w / np.linalg.norm(u_w)
+    u_l = np.cross(u_h, u_w)
+    u_l = u_l / np.linalg.norm(u_l)
+
+    # Ma tran xoay 3x3 truc giao SO(3)
+    R = np.vstack([u_w, u_l, u_h])
+
+    v_rot = (R @ centered.T).T
+
+    # 4. Can tam X, Y ve 0 va dat day tiep xuc sat san Z=0
+    z_min = v_rot[:, 2].min()
+    v_rot[:, 0] -= v_rot[:, 0].mean()
+    v_rot[:, 1] -= v_rot[:, 1].mean()
+    v_rot[:, 2] -= z_min
+
+    aligned_mesh = o3d.geometry.TriangleMesh()
+    aligned_mesh.vertices = o3d.utility.Vector3dVector(v_rot)
+    aligned_mesh.triangles = mesh.triangles
+    if mesh.has_vertex_colors() and len(mesh.vertex_colors) == len(mesh.vertices):
+        aligned_mesh.vertex_colors = mesh.vertex_colors
+    aligned_mesh.compute_triangle_normals()
+    aligned_mesh.compute_vertex_normals()
+
+    print(f"  [Can truc PCA] Hoan tat: X={v_rot[:, 0].ptp():.2f}, Y={v_rot[:, 1].ptp():.2f}, Z={v_rot[:, 2].max():.2f} (sat san Z=0)")
+    return aligned_mesh
+
+
 # ---------------------------------------------------------------------------
 # XUAT .OBJ
 # ---------------------------------------------------------------------------
@@ -562,60 +1084,103 @@ def run(sample_name: str, cfg: dict) -> None:
     if n_raw == 0:
         raise RuntimeError("Khong co diem nao. Kiem tra file .ply tu Buoc 3.")
 
-    # --- Loc nhieu + giu cluster lon nhat ---
-    print("[Buoc 4] Loc nhieu...")
-    pc, diag = _clean(pc, e)
-    if e.get("floor_cut_frac", 0) > 0:
-        pts = np.asarray(pc.points)
-        y_min = pts[:, 1].min()
-        y_max = pts[:, 1].max()
-        threshold = y_min + e["floor_cut_frac"] * (y_max - y_min)
-        keep = np.where(pts[:, 1] > threshold)[0]
-        pc = pc.select_by_index(keep)
-        print(f"  cat nen: loai {len(pts)-len(keep):,} diem duoi y={threshold:.4f}")
+    # Xac dinh loai vat the de kich hoat Noi suy hinh hoc 3D phu hop
+    prompt = str(cfg.get("masking", {}).get("prompt", "object")).strip().lower()
+    prefix = sample_name.split("_")[0].lower()
+    cyl_keywords = ("jar", "bottle", "cup", "can", "vase", "mug")
+    box_keywords = ("box", "carton", "package", "cube")
 
-    # --- MLS Point Cloud Pre-smoothing (triet tieu gon song toa do tu camera) ---
-    if e.get("mls_iter", 1) > 0 and len(pc.points) > 30:
-        print("[Buoc 4] Lam muot toa do diem (MLS)...")
-        pc = _smooth_point_cloud_mls(pc, e)
+    is_cyl_target = prefix in cyl_keywords or any(k in prompt for k in cyl_keywords)
+    is_box_target = (
+        not is_cyl_target
+        and prefix not in ("mouse",)
+        and (
+            mode == "obb"
+            or prefix in box_keywords
+            or any(k in prompt for k in box_keywords)
+        )
+    )
+    interp_enabled = bool(e.get("interpolate_surface", True))
 
-    # Luu point cloud sach de debug trong Blender
-    clean_ply = out_dir / "point_cloud_clean.ply"
-    o3d.io.write_point_cloud(str(clean_ply), pc)
-    print(f"  da luu point cloud sach -> {clean_ply.name}")
-
-    # --- Phap tuyen (dung cho Poisson va Both) ---
-    need_normals = mode in ("poisson", "both")
-    if need_normals:
-        print("[Buoc 4] Tinh vector phap tuyen...")
-        pc = _compute_normals(pc, e, diag)
-
-    # --- Dung mesh + xuat 1 file duy nhat ten theo ten mau ---
-    # Vi du: mau "mouse_01" -> mouse_01.obj | mau "box_01" -> box_01.obj
     obj_path = out_dir / f"{sample_name}.obj"
+    clean_ply = out_dir / "point_cloud_clean.ply"
 
-    if mode == "obb":
-        print("[Buoc 4] OBB fitting...")
-        mesh = _obb_mesh(pc)
+    if interp_enabled and is_box_target:
+        # Voi hinh hop: goi truc tiep _complete_box_geometry de giu tron ven cum chu mat truoc & vien canh
+        print("[Buoc 4] Loc nhieu & Noi suy 6 mat hinh hop (Orthogonal RANSAC + Surface Interpolation)...")
+        pc, mesh = _complete_box_geometry(pc, e)
+        o3d.io.write_point_cloud(str(clean_ply), pc)
+        print(f"  da luu point cloud da noi suy 6 mat -> {clean_ply.name}")
 
-    elif mode == "poisson":
-        print("[Buoc 4] Poisson surface reconstruction...")
-        mesh = _poisson_mesh(pc, e)
-        if e.get("make_watertight", False):
-            print("[Buoc 4] Dong kin mesh (watertight)...")
-            mesh = _make_watertight(mesh)
+    elif interp_enabled and is_cyl_target:
+        print("[Buoc 4] Loc nhieu & Noi suy doi xung tron xoay 360° (Cylindrical Interpolation)...")
+        pc, diag = _clean(pc, e)
+        if e.get("remove_table_plane", True):
+            pc = _remove_plane_ransac(pc, diag, e)
+        pc, mesh = _complete_cylinder_geometry(pc, e)
+        o3d.io.write_point_cloud(str(clean_ply), pc)
+        print(f"  da luu point cloud da noi suy 360° -> {clean_ply.name}")
 
-    else:  # mode == "both": Poisson (be mat thuc) + OBB (hop tham chieu)
-        print("[Buoc 4] OBB fitting (hop tham chieu)...")
-        obb = _obb_mesh(pc)
-        print("[Buoc 4] Poisson surface reconstruction (be mat thuc te)...")
-        poi = _poisson_mesh(pc, e)
-        if e.get("make_watertight", False):
-            print("[Buoc 4] Dong kin Poisson mesh...")
-            poi = _make_watertight(poi)
-        mesh = obb + poi   # gop OBB + Poisson
-        mesh.compute_vertex_normals()
-        print(f"  gop mesh: {len(mesh.vertices):,} dinh, {len(mesh.triangles):,} tam giac")
+    else:
+        # --- Loc nhieu + giu cluster lon nhat ---
+        print("[Buoc 4] Loc nhieu...")
+        pc, diag = _clean(pc, e)
+
+        # --- Tu dong loai bo mat phang san / ban xoay (RANSAC) ---
+        if e.get("remove_table_plane", True):
+            pc = _remove_plane_ransac(pc, diag, e)
+
+        if e.get("floor_cut_frac", 0) > 0:
+            pts = np.asarray(pc.points)
+            y_min = pts[:, 1].min()
+            y_max = pts[:, 1].max()
+            threshold = y_min + e["floor_cut_frac"] * (y_max - y_min)
+            keep = np.where(pts[:, 1] > threshold)[0]
+            pc = pc.select_by_index(keep)
+            print(f"  cat nen: loai {len(pts)-len(keep):,} diem duoi y={threshold:.4f}")
+
+        # --- MLS Point Cloud Pre-smoothing (triet tieu gon song toa do tu camera) ---
+        if e.get("mls_iter", 1) > 0 and len(pc.points) > 30:
+            print("[Buoc 4] Lam muot toa do diem (MLS)...")
+            pc = _smooth_point_cloud_mls(pc, e)
+
+        # Luu point cloud sach de debug trong Blender
+        o3d.io.write_point_cloud(str(clean_ply), pc)
+        print(f"  da luu point cloud sach -> {clean_ply.name}")
+
+        # --- Phap tuyen (dung cho Poisson va Both) ---
+        need_normals = mode in ("poisson", "both")
+        if need_normals:
+            print("[Buoc 4] Tinh vector phap tuyen...")
+            pc = _compute_normals(pc, e, diag)
+
+        if mode == "obb":
+            print("[Buoc 4] OBB fitting...")
+            mesh = _obb_mesh(pc)
+
+        elif mode == "poisson":
+            print("[Buoc 4] Poisson surface reconstruction...")
+            mesh = _poisson_mesh(pc, e)
+            if e.get("make_watertight", False):
+                print("[Buoc 4] Dong kin mesh (watertight)...")
+                mesh = _make_watertight(mesh)
+
+        else:  # mode == "both": Poisson (be mat thuc) + OBB (hop tham chieu)
+            print("[Buoc 4] OBB fitting (hop tham chieu)...")
+            obb = _obb_mesh(pc)
+            print("[Buoc 4] Poisson surface reconstruction (be mat thuc te)...")
+            poi = _poisson_mesh(pc, e)
+            if e.get("make_watertight", False):
+                print("[Buoc 4] Dong kin Poisson mesh...")
+                poi = _make_watertight(poi)
+            mesh = obb + poi   # gop OBB + Poisson
+            mesh.compute_vertex_normals()
+            print(f"  gop mesh: {len(mesh.vertices):,} dinh, {len(mesh.triangles):,} tam giac")
+
+        # --- Can thang dung (Z-up), can tam (X=0, Y=0) va dat day mesh len san (Z=0) ---
+        if e.get("align_upright", True):
+            print("[Buoc 4] Can thang truc (Z-up) & dat len mat san (Z=0)...")
+            mesh = _align_upright_and_ground(mesh)
 
     # --- Xuat ban dung khoi tao ---
     print(f"[Buoc 4] Xuat {obj_path.name}...")

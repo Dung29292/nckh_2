@@ -21,7 +21,8 @@ masking:             # Buoc 2
   box_threshold: 0.3
   text_threshold: 0.25
   detect_frames: 6
-  box_pad_frac: 0.05            # mo rong box 5% tranh cat vien cong vat the
+  box_pad_frac: 0.02            # mo rong box nhe (2%) tranh cat vien vat the
+  base_pad_bottom_frac: 0.0     # 0.0: chi lay vat the, khong lay sach/de o duoi
   sam2_config: "configs/sam2.1/sam2.1_hiera_t.yaml"
   sam2_checkpoint: models/sam2/sam2.1_hiera_tiny.pt
   dilate_px: 0                  # 0: khong dilate; tang 2-5 neu vat the co vien mong
@@ -30,11 +31,15 @@ reconstruction:
   method: colmap_mvs            # splatfacto hoặc colmap_mvs
   pose_method: colmap       
   capture_mode: turntable
-  matching_method: exhaustive
+  matching_method: exhaustive   # exhaustive hoac sequential (dung sequential neu frame noi tiep deu)
+  sequential_overlap: 15        # so frame lan can khi dung sequential matching
+  sift_peak_threshold: 0.003    # nguong loc dac trung SIFT (0.002-0.004 giup bat dac trung vat the it texture nhu lo/coc)
+  sift_max_features: 8192       # so dac trung toi da moi frame
   min_pose_ratio: 0.5
+  warn_pose_collapse: true      # canh bao khi quy dao camera bi ket/don cuc (gay ra song bien)
 
 mesh_export:         # Buoc 4
-  mesh_mode: poisson            # obb (hop 6 mat) | poisson (be mat cong/phi phang) | both
+  mesh_mode: poisson           # obb (hop 6 mat) | poisson (be mat cong/phi phang) | both
   poisson_depth: 7              # 7 giup be mat cong cang tron, muot ma; tang 8 neu can chi tiet cuc nho
   poisson_density_quantile: 0.01 # 0.01 chi cat vien mo, khong bi rach lung vat the nhu 0.05
   stat_nb: 20
@@ -66,11 +71,19 @@ mesh_export:         # Buoc 4
   # false: giu dung 100% be mat thuc te cua vat the phi phang; true: bit phang day
   make_watertight: false
 
+  # --- Loc mat phang ban xoay / de hoa van (RANSAC) ---
+  remove_table_plane: true      # tu dong cat bo mat phang ban xoay ma khong chem cheo vat the
+  plane_dist_threshold_frac: 0.012 # nguong khoang cach xac dinh diem thuoc mat phang san
+
   # --- Cat phan thua ngoai vat the (vay Poisson) ---
   poisson_hull_pad_frac: 0.03
 
+  # --- Can thang dung (Z-up) & dat len mat san (Z=0) ---
+  align_upright: true           # tu dong can thang truc Z-up, dua ve goc (0,0) va tiep dat sat san Z=0
+
 mesh_refine:             # Buoc 5: Pipeline tinh chinh & lam min chuyen sau (chay doc lap hoac tu dong)
   auto_run: true                # tu dong chay ngay sau buoc 4
+  align_upright: true           # bao toan can thang truc va dat sat san Z=0
   taubin_iter: 45               # so vong Taubin triet tieu song/ranh khong teo the tich
   taubin_lambda: 0.5
   taubin_mu: -0.53
