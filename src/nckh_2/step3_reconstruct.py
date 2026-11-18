@@ -76,8 +76,8 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
     db = colmap_dir / "database.db"
     images = sdir / "frames_sharp"
 
-    peak_thresh = str(rc.get("sift_peak_threshold", 0.003))
-    max_features = str(rc.get("sift_max_features", 8192))
+    peak_thresh = str(rc.get("sift_peak_threshold", 0.001))
+    max_features = str(rc.get("sift_max_features", 16384))
 
     extract = [
         "colmap", "feature_extractor",
@@ -97,30 +97,37 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         extract += ["--ImageReader.mask_path", str(mask_dir)]
     _run(extract)
 
-    if rc.get("matching_method") == "sequential":
-        overlap = str(rc.get("sequential_overlap", 15))
-        matcher_cmd = [
-            "colmap", "sequential_matcher",
-            "--database_path", str(db),
-            "--FeatureMatching.use_gpu", "1",
-            "--FeatureMatching.guided_matching", "1",
-            "--SequentialMatching.overlap", overlap,
-            "--SequentialMatching.quadratic_overlap", "1",
-        ]
-    else:
-        matcher_cmd = [
-            "colmap", "exhaustive_matcher",
-            "--database_path", str(db),
-            "--FeatureMatching.use_gpu", "1",
-            "--FeatureMatching.guided_matching", "1",
-        ]
-    _run(matcher_cmd)
+    # Chay sequential matcher de lien ket cac frame lien tiep theo thoi gian
+    overlap = str(rc.get("sequential_overlap", 25))
+    seq_cmd = [
+        "colmap", "sequential_matcher",
+        "--database_path", str(db),
+        "--FeatureMatching.use_gpu", "1",
+        "--FeatureMatching.guided_matching", "1",
+        "--SequentialMatching.overlap", overlap,
+        "--SequentialMatching.quadratic_overlap", "1",
+    ]
+    _run(seq_cmd)
+
+    # Chay exhaustive matcher de ket noi them cac frame doi dien & cheo goc
+    exh_cmd = [
+        "colmap", "exhaustive_matcher",
+        "--database_path", str(db),
+        "--FeatureMatching.use_gpu", "1",
+        "--FeatureMatching.guided_matching", "1",
+    ]
+    _run(exh_cmd)
 
     _run([
         "colmap", "mapper",
         "--database_path", str(db),
         "--image_path", str(images),
         "--output_path", str(colmap_dir / "sparse"),
+        "--Mapper.min_num_matches", str(rc.get("mapper_min_num_matches", 10)),
+        "--Mapper.init_min_num_inliers", str(rc.get("mapper_init_min_inliers", 30)),
+        "--Mapper.abs_pose_min_num_inliers", str(rc.get("mapper_abs_pose_min_inliers", 15)),
+        "--Mapper.filter_max_reproj_error", str(rc.get("mapper_filter_max_reproj_error", 6.0)),
+        "--Mapper.tri_ignore_two_view_tracks", "0",
     ])
     _promote_largest_model(colmap_dir / "sparse")
     return _finish_process_data(sdir, nf_dir, cfg)
@@ -311,12 +318,21 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
     ])
 
     geom = rc.get("mvs_geom_consistency", False)
-    _run([
-        "colmap", "patch_match_stereo",
-        "--workspace_path", str(dense),
-        "--workspace_format", "COLMAP",
-        "--PatchMatchStereo.geom_consistency", "true" if geom else "false",
-    ])
+    try:
+        _run([
+            "colmap", "patch_match_stereo",
+            "--workspace_path", str(dense),
+            "--workspace_format", "COLMAP",
+            "--PatchMatchStereo.geom_consistency", "true" if geom else "false",
+        ])
+    except subprocess.CalledProcessError as err:
+        # Tren Windows, CUDA DLL doi khi tra ve ma loi (nhu 3221226505) khi giai phong bo nho o cuoi lenh
+        # Neu da ghi duoc depth maps thi coi nhu thanh cong va tiep tuc
+        depth_maps = list((dense / "stereo" / "depth_maps").glob("*.photometric.bin"))
+        if len(depth_maps) > 0:
+            print(f"  [COLMAP MVS] Da tao {len(depth_maps)} depth maps (bo qua ma loi exit {err.returncode})")
+        else:
+            raise
 
     fuse = [
         "colmap", "stereo_fusion",
@@ -341,8 +357,10 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
                 if m_im.shape[:2] != (hu, wu):
                     m_im = cv2.resize(m_im, (wu, hu), interpolation=cv2.INTER_NEAREST)
                 cv2.imwrite(str(mask_dir / f"{img_p.name}.png"), m_im)
+                cv2.imwrite(str(mask_dir / f"{img_p.stem}.png"), m_im)
             else:
                 shutil.copy(m_src, mask_dir / f"{img_p.name}.png")
+                shutil.copy(m_src, mask_dir / f"{img_p.stem}.png")
         fuse += ["--StereoFusion.mask_path", str(mask_dir)]
     _run(fuse)
 

@@ -47,7 +47,7 @@ mesh_export:         # Buoc 4
   rad_nb: 5
   rad_radius_frac: 0.03
   cluster_eps_frac: 0.02        # ban kinh DBSCAN loc nhieu troi noi
-  cluster_min_ratio: 0.12       # giu cac cum con >= 12% cum chinh, khong cat mat phan vat the
+  cluster_min_ratio: 0.03       # giu cac cum con >= 3% cum chinh (bao ve nap cam, quai xach khoi bi cat)
   cluster_min_points: 40
   voxel_frac: 0.005             # hop nhat lop diem kep tranh tao gon song
   normal_radius_frac: 0.07      # ban kinh tinh phap tuyen em ai, tranh giat cuc bo

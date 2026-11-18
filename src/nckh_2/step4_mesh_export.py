@@ -412,16 +412,20 @@ def _poisson_mesh(pc: o3d.geometry.PointCloud, e: dict) -> o3d.geometry.Triangle
         mesh.remove_vertices_by_mask(v_mask)
         mesh.remove_non_manifold_edges()
 
-    # --- Giu thanh phan lien thong lon nhat (loai manh mesh roi rac do nhieu) ---
+    # --- Giu cac thanh phan lien thong hop le (bao toan ca nap, quai xach va than hop) ---
     tri_clusters, n_tris_per_cluster, _ = mesh.cluster_connected_triangles()
     tri_clusters = np.asarray(tri_clusters)
     n_tris_per_cluster = np.asarray(n_tris_per_cluster)
     if len(n_tris_per_cluster) > 0:
         largest = n_tris_per_cluster.argmax()
+        largest_n = n_tris_per_cluster[largest]
+        threshold = max(30, int(largest_n * 0.03))
+        keep_clusters = set(np.where(n_tris_per_cluster >= threshold)[0])
+        keep_mask = np.isin(tri_clusters, list(keep_clusters))
         before_t = len(mesh.triangles)
-        mesh.remove_triangles_by_mask(tri_clusters != largest)
+        mesh.remove_triangles_by_mask(~keep_mask)
         mesh.remove_unreferenced_vertices()
-        print(f"  giu thanh phan lon nhat: {len(n_tris_per_cluster)} manh, "
+        print(f"  giu {len(keep_clusters)}/{len(n_tris_per_cluster)} manh hop le (>=3% cum chinh): "
               f"{before_t:,} -> {len(mesh.triangles):,} tam giac")
 
     # --- Mesh smoothing: lam min duong cong be mat, triet tieu gon song (ripples) ---
@@ -588,12 +592,9 @@ def _build_colored_box_mesh(
     H: float,
     pc_interp: o3d.geometry.PointCloud,
     subdiv_step: float,
+    pc_raw_ortho: o3d.geometry.PointCloud | None = None,
 ) -> o3d.geometry.TriangleMesh:
-    """Tao mesh hop 6 mat kin (watertight) mat do cao, giu nguyen mau sac & hoa tiet that tren cac mat."""
-    nx = max(12, int(round(W / subdiv_step)))
-    ny = max(12, int(round(D / subdiv_step)))
-    nz = max(10, int(round(H / subdiv_step)))
-
+    """Tao mesh hop 6 mat kin (watertight) mat do cao, giu nguyen mau sac & noi khoi 3D (quai xach/nap hop)."""
     # Dung mesh hop chuan cua Open3D roi subdivide de giu topology watertight 100%
     box = o3d.geometry.TriangleMesh.create_box(width=W, height=D, depth=H)
     box.translate([-W / 2.0, -D / 2.0, 0.0])
@@ -601,6 +602,33 @@ def _build_colored_box_mesh(
     box = box.subdivide_midpoint(number_of_iterations=5)
     box.remove_duplicated_vertices()
     box.remove_degenerate_triangles()
+
+    verts = np.asarray(box.vertices).copy()
+
+    # Bien dang cac dinh (mat tren, mat truoc) de giu tron ven chi tiet noi 3D (quai xach, khoa cai, ranh khia)
+    if pc_raw_ortho is not None and len(pc_raw_ortho.points) > 0:
+        kd_raw = o3d.geometry.KDTreeFlann(pc_raw_ortho)
+        raw_pts = np.asarray(pc_raw_ortho.points)
+        search_rad = max(0.18 * H, subdiv_step * 3.5)
+        for i, v in enumerate(verts):
+            # Mat tren (+Z): bien dang theo quai xach va mat nap that
+            if v[2] > 0.85 * H:
+                _, idxs, _ = kd_raw.search_hybrid_vector_3d(v, radius=search_rad, max_nn=25)
+                if len(idxs) > 0:
+                    cand_z = raw_pts[idxs, 2]
+                    z_top = float(np.percentile(cand_z, 85))
+                    if z_top > 0.75 * H:
+                        verts[i, 2] = z_top
+            # Mat truoc (-Y): bien dang theo khoa cai hop va gân than hop that (latch protrusion)
+            elif v[1] < -0.35 * D:
+                _, idxs, _ = kd_raw.search_hybrid_vector_3d(v, radius=search_rad, max_nn=25)
+                if len(idxs) > 0:
+                    cand_y = raw_pts[idxs, 1]
+                    y_front = float(np.percentile(cand_y, 20))
+                    if y_front < -0.25 * D:
+                        verts[i, 1] = y_front
+
+    box.vertices = o3d.utility.Vector3dVector(verts)
 
     # Gan mau tu point cloud da noi suy sang tung dinh mesh
     if pc_interp.has_colors() and len(pc_interp.points) > 0:
@@ -613,9 +641,9 @@ def _build_colored_box_mesh(
             w = 1.0 / (np.sqrt(dists) + 1e-5)
             w /= w.sum()
             v_cols[i] = (pc_cols[idxs] * w[:, None]).sum(axis=0)
-        box.vertex_colors = o3d.utility.Vector3dVector(v_cols)
+        box.vertex_colors = o3d.utility.Vector3dVector(np.clip(v_cols, 0.0, 1.0))
 
-    # Lam mem nhe canh sac (bevel tu nhien) ma van giu phang 6 mat
+    # Lam mem nhe canh sac (bevel tu nhien) ma van giu phang 6 mat va khoi quai xach
     box = box.filter_smooth_taubin(number_of_iterations=3, lambda_filter=0.45, mu=-0.48)
     verts = np.asarray(box.vertices)
     verts[:, 2] -= verts[:, 2].min()
@@ -686,54 +714,94 @@ def _complete_box_geometry(
     n3 = np.cross(n1, n2)
     n3 /= np.linalg.norm(n3)
 
-    R = np.vstack([n3, n2, n1])
-    p_ortho = (R @ pts.T).T
+    cand_axes = [n3, n2, n1]
+    pts_cent = pts - np.median(pts, axis=0)
 
-    # Dinh huong +Z cho mat nap tren va -Y cho mat truoc
-    if np.median(p_ortho[inliers1, 2]) < np.median(p_ortho[:, 2]):
-        R[2] *= -1
-        p_ortho[:, 2] *= -1
-    rem_ortho = np.delete(p_ortho, inliers1, axis=0)
-    if len(rem_ortho) > 0 and len(inliers2) > 0:
-        if np.median(rem_ortho[inliers2, 1]) > np.median(p_ortho[:, 1]):
-            R[1] *= -1
-            p_ortho[:, 1] *= -1
-    if np.linalg.det(R) < 0:
-        R[0] *= -1
-        p_ortho[:, 0] *= -1
+    # 1. Tinh do mo rong (span) cua point cloud doc theo tung truc truc giao
+    spans = [float(np.percentile(pts_cent @ ax, 97) - np.percentile(pts_cent @ ax, 3)) for ax in cand_axes]
+
+    # Phan loai mau co ban: nap cam va than den/sam, tem trang
+    r_cols = cols[:, 0]
+    g_cols = cols[:, 1]
+    b_cols = cols[:, 2]
+    is_orange = (r_cols > 0.50) & (g_cols < 0.55) & (b_cols < 0.40) & (r_cols > b_cols * 1.4)
+    is_dark = (r_cols < 0.35) & (g_cols < 0.35) & (b_cols < 0.35)
+    is_white = (r_cols > 0.55) & (g_cols > 0.55) & (b_cols > 0.55)
+
+    # 2. Xac dinh truc chieu cao Z (Vertical):
+    # Neu co nap cam va than den: truc Z la truc song song nhat voi vector tu than den len nap cam!
+    if np.any(is_orange) and np.any(is_dark):
+        lid_vec = pts[is_orange].mean(axis=0) - pts[is_dark].mean(axis=0)
+        lid_vec /= (np.linalg.norm(lid_vec) + 1e-8)
+        dots = [abs(np.dot(ax, lid_vec)) for ax in cand_axes]
+        z_idx = int(np.argmax(dots))
+    else:
+        # Fallback: chieu cao cua hop nam tren ban thuong la chieu ngan nhat
+        z_idx = int(np.argmin(spans))
+
+    # 3. Hai truc con lai: truc dai hon la Chieu dai/Chieu rong W (truc X), truc con lai la Chieu sau D (truc Y)
+    other_idxs = [i for i in range(3) if i != z_idx]
+    if spans[other_idxs[0]] >= spans[other_idxs[1]]:
+        x_idx, y_idx = other_idxs[0], other_idxs[1]
+    else:
+        x_idx, y_idx = other_idxs[1], other_idxs[0]
+
+    ax_x = cand_axes[x_idx].copy()
+    ax_y = cand_axes[y_idx].copy()
+    ax_z = cand_axes[z_idx].copy()
+
+    # 4. Dinh huong +Z huong len phia nap cam
+    if np.any(is_orange) and np.any(is_dark) and np.dot(ax_z, lid_vec) < 0:
+        ax_z = -ax_z
+
+    # 5. Dinh huong -Y huong ve mat truoc (mat co tem/khoa cai quay ve phia camera)
+    p_y = pts_cent @ ax_y
+    if np.any(is_white) and np.any(is_dark):
+        if np.median(p_y[is_white]) > np.median(p_y[is_dark]):
+            ax_y = -ax_y
+
+    # 6. Dam bao he truc toa do ban tay phai (det(R) = +1)
+    if np.dot(np.cross(ax_x, ax_y), ax_z) < 0:
+        ax_x = -ax_x
+
+    R = np.vstack([ax_x, ax_y, ax_z])
+    p_ortho = (R @ pts_cent.T).T
 
     # Xac dinh kich thuoc hop (W, D, H) trong he truc truc giao
-    z_max = float(np.median(p_ortho[inliers1, 2]))
-    z_min = float(np.percentile(rem_ortho[:, 2], 3)) if len(rem_ortho) > 10 else float(np.percentile(p_ortho[:, 2], 2))
-    y_min = float(np.median(rem_ortho[inliers2, 1])) if len(rem_ortho) > 10 and len(inliers2) > 10 else float(np.percentile(p_ortho[:, 1], 2))
-    y_max = float(np.percentile(p_ortho[inliers1, 1], 97))
-    x_min = float(np.percentile(p_ortho[:, 0], 2))
-    x_max = float(np.percentile(p_ortho[:, 0], 98))
+    x_min, x_max = [float(v) for v in np.percentile(p_ortho[:, 0], [2, 98])]
+    z_min, z_max = [float(v) for v in np.percentile(p_ortho[:, 2], [2, 98])]
+    y_min = float(np.percentile(p_ortho[:, 1], 2))
+    y_max = float(np.percentile(p_ortho[:, 1], 98))
+
+    W = max(0.1, x_max - x_min)
+    H = max(0.1, z_max - z_min)
+    measured_D = max(0.1, y_max - y_min)
+    # Bao ve chieu sau: hop do nghe / hop carton thuc te luon co chieu sau toi thieu >= 55% chieu dai W va >= 120% chieu cao H
+    min_realistic_D = max(0.55 * W, 1.20 * H)
+    if measured_D < min_realistic_D:
+        y_max = y_min + min_realistic_D
+        D = min_realistic_D
+    else:
+        D = measured_D
 
     cx = (x_min + x_max) / 2.0
     cy = (y_min + y_max) / 2.0
-    W = max(0.1, x_max - x_min)
-    D = max(0.1, y_max - y_min)
-    H = max(0.1, z_max - z_min)
 
     p_ortho[:, 0] -= cx
     p_ortho[:, 1] -= cy
     p_ortho[:, 2] -= z_min
 
-    base_color = np.median(cols[inliers1], axis=0)
+    orange_color = np.median(cols[is_orange], axis=0) if np.any(is_orange) else np.median(cols[inliers1], axis=0)
+    dark_color = np.median(cols[is_dark], axis=0) if np.any(is_dark) else np.array([0.15, 0.15, 0.15])
+    lid_z = 0.72 * H
 
     in_bounds = (
-        (p_ortho[:, 0] >= -W / 2 - 0.05 * W) & (p_ortho[:, 0] <= W / 2 + 0.05 * W) &
-        (p_ortho[:, 1] >= -D / 2 - 0.05 * D) & (p_ortho[:, 1] <= D / 2 + 0.05 * D) &
-        (p_ortho[:, 2] >= -0.05 * H) & (p_ortho[:, 2] <= H + 0.05 * H)
+        (p_ortho[:, 0] >= -W / 2 - 0.08 * W) & (p_ortho[:, 0] <= W / 2 + 0.08 * W) &
+        (p_ortho[:, 1] >= -D / 2 - 0.08 * D) & (p_ortho[:, 1] <= D / 2 + 0.08 * D) &
+        (p_ortho[:, 2] >= -0.05 * H) & (p_ortho[:, 2] <= H + 0.20 * H)
     )
-    p_real = np.clip(p_ortho[in_bounds], [-W / 2, -D / 2, 0.0], [W / 2, D / 2, H])
+    p_real = np.clip(p_ortho[in_bounds], [-W / 2, -D / 2, 0.0], [W / 2, D / 2, H * 1.25])
     c_real = cols[in_bounds]
-
-    top_mask = p_real[:, 2] > 0.85 * H
-    front_mask = (~top_mask) & (p_real[:, 1] < -0.30 * D)
-    p_real[top_mask, 2] = H
-    p_real[front_mask, 1] = -D / 2.0
 
     step = W / 65.0
     xs = np.linspace(-W / 2, W / 2, max(12, int(round(W / step))))
@@ -745,12 +813,16 @@ def _complete_box_geometry(
     pc_real.colors = o3d.utility.Vector3dVector(c_real)
     kdtree = o3d.geometry.KDTreeFlann(pc_real)
 
+    pc_raw_ortho = o3d.geometry.PointCloud()
+    pc_raw_ortho.points = o3d.utility.Vector3dVector(p_ortho)
+
     interp_pts, interp_cols, interp_norms = [], [], []
 
-    def _add_face(u_vals, v_vals, make_xyz, normal_vec, mirror_front=False):
+    def _add_face(u_vals, v_vals, make_xyz, normal_vec, mirror_front=False, is_top=False):
         uu, vv = np.meshgrid(u_vals, v_vals, indexing="ij")
         f_pts = make_xyz(uu.ravel(), vv.ravel())
-        f_cols = np.tile(base_color, (len(f_pts), 1))
+        fallback_col = orange_color if is_top else dark_color
+        f_cols = np.tile(fallback_col, (len(f_pts), 1))
         for idx_p, pt in enumerate(f_pts):
             q_pt = np.array([pt[0], -D / 2.0, pt[2]]) if mirror_front else pt
             _, idxs, dists = kdtree.search_knn_vector_3d(q_pt, 3)
@@ -758,11 +830,13 @@ def _complete_box_geometry(
                 w_knn = 1.0 / (np.sqrt(dists) + 1e-5)
                 w_knn /= w_knn.sum()
                 f_cols[idx_p] = (c_real[idxs] * w_knn[:, None]).sum(axis=0)
+            elif pt[2] >= lid_z:
+                f_cols[idx_p] = orange_color
         interp_pts.append(f_pts)
         interp_cols.append(f_cols)
         interp_norms.append(np.tile(normal_vec, (len(f_pts), 1)))
 
-    _add_face(xs, ys, lambda u, v: np.column_stack([u, v, np.full_like(u, H)]), [0, 0, 1])
+    _add_face(xs, ys, lambda u, v: np.column_stack([u, v, np.full_like(u, H)]), [0, 0, 1], is_top=True)
     _add_face(xs, ys, lambda u, v: np.column_stack([u, v, np.zeros_like(u)]), [0, 0, -1])
     _add_face(xs, zs, lambda u, v: np.column_stack([u, np.full_like(u, -D / 2), v]), [0, -1, 0])
     _add_face(xs, zs, lambda u, v: np.column_stack([u, np.full_like(u, D / 2), v]), [0, 1, 0], mirror_front=True)
@@ -774,7 +848,7 @@ def _complete_box_geometry(
     pc_out.colors = o3d.utility.Vector3dVector(np.vstack(interp_cols))
     pc_out.normals = o3d.utility.Vector3dVector(np.vstack(interp_norms))
 
-    mesh_out = _build_colored_box_mesh(W, D, H, pc_out, step)
+    mesh_out = _build_colored_box_mesh(W, D, H, pc_out, step, pc_raw_ortho=pc_raw_ortho)
     print(
         f"  [Noi suy Hop 6 mat] Kich thuoc: W={W:.2f} x D={D:.2f} x H={H:.2f} | "
         f"PointCloud={len(pc_out.points):,} diem | Mesh={len(mesh_out.vertices):,} dinh (watertight={mesh_out.is_watertight()})"

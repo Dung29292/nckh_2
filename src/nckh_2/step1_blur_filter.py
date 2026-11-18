@@ -13,11 +13,20 @@ from . import paths
 
 
 def laplacian_variance(frame: np.ndarray, score_width: int) -> float:
+    """Tinh do net uu tien vung Focus trung tam (70% ROI giua khung hinh + 30% toan anh)
+    de tranh bi danh lua boi nen tinh (ke sach, chai nuoc) khi vat the o giua bi rung mo."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     if w > score_width:
         gray = cv2.resize(gray, (score_width, int(h * score_width / w)), interpolation=cv2.INTER_AREA)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    gh, gw = gray.shape
+    global_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    # Vung focus trung tam (chua vat the chinh: 60% chieu ngang x 70% chieu doc)
+    y1, y2 = int(0.15 * gh), int(0.85 * gh)
+    x1, x2 = int(0.20 * gw), int(0.80 * gw)
+    roi = gray[y1:y2, x1:x2]
+    roi_var = float(cv2.Laplacian(roi, cv2.CV_64F).var()) if roi.size > 0 else global_var
+    return 0.70 * roi_var + 0.30 * global_var
 
 
 def select_indices(scores, window: int, min_ratio: float, max_frames: int) -> list[int]:

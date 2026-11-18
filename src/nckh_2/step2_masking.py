@@ -19,9 +19,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _detect_box(frames_dir: Path, frame_files: list[str], cfg_m: dict):
-    """Chay Grounding DINO tim bounding box vat the tren tap frame mau.
-    Ho tro thu nhieu prompt (prompt chinh + fallback) va mo rong le bounding box
-    de tranh bi cat mat cac vien cong cua vat the phi phang."""
+    """Chay Grounding DINO tim bounding box vat the tren nhieu keyframe rai deu khap video.
+    Ho tro Multi-Keyframe Focus Box de giu tron ven cac bo phan cung mau (nhu quai xach den
+    trung mau man hinh den phia sau) va khong bi mat dau khi lat 6 mat vat the."""
     cache = paths.MODELS_DIR / "grounding_dino"
     try:
         processor = AutoProcessor.from_pretrained(cfg_m["dino_model_id"], cache_dir=cache, local_files_only=True)
@@ -36,25 +36,29 @@ def _detect_box(frames_dir: Path, frame_files: list[str], cfg_m: dict):
     model.eval()
 
     n = len(frame_files)
-    k = min(max(cfg_m.get("detect_frames", 5), 8), n)
+    k = min(max(int(cfg_m.get("detect_frames", 10)), 10), n)
     idxs = np.linspace(0, n - 1, k).round().astype(int)
 
-    # Danh sach prompt de thu: prompt nguoi dung chi dinh -> prompt tong quat
     raw_prompt = cfg_m.get("prompt", "object").strip().lower()
-    prompts_to_try = [raw_prompt]
-    for alt in ["object", "item", "product", "toy"]:
-        if alt not in raw_prompt and alt not in prompts_to_try:
-            prompts_to_try.append(alt)
+    if "box" in raw_prompt:
+        prompts_to_try = ["toolbox. box. case.", raw_prompt, "object"]
+    else:
+        prompts_to_try = [raw_prompt]
+        for alt in ["toolbox. box. case.", "object", "item", "product"]:
+            if alt not in raw_prompt and alt not in prompts_to_try:
+                prompts_to_try.append(alt)
 
-    box_thresh = float(cfg_m.get("box_threshold", 0.3))
-    text_thresh = float(cfg_m.get("text_threshold", 0.25))
-    pad_frac = float(cfg_m.get("box_pad_frac", 0.05))
+    box_thresh = float(cfg_m.get("box_threshold", 0.28))
+    text_thresh = float(cfg_m.get("text_threshold", 0.22))
+    pad_frac = float(cfg_m.get("box_pad_frac", 0.02))
+    pad_bottom = float(cfg_m.get("base_pad_bottom_frac", 0.0))
 
-    best = None  # (score, frame_idx, box_xyxy, prompt_used, img_size)
+    best = None  # (score, frame_idx, padded_box, raw_box, prompt_used)
+    keyframe_boxes: dict[int, list[float]] = {}
 
     for p_try in prompts_to_try:
         p_query = p_try if p_try.endswith(".") else f"{p_try}."
-        print(f"[Buoc 2] Thu nhan dien voi prompt: '{p_try}'...")
+        print(f"[Buoc 2] Thu nhan dien Focus Box voi prompt: '{p_try}' tren {len(idxs)} keyframes...")
 
         for i in tqdm(idxs, desc=f"Buoc 2a: tim '{p_try}'"):
             img = Image.open(frames_dir / frame_files[i]).convert("RGB")
@@ -78,27 +82,42 @@ def _detect_box(frames_dir: Path, frame_files: list[str], cfg_m: dict):
                 )[0]
             if len(result["scores"]) == 0:
                 continue
-            
-            # Chon box tot nhat o frame nay
+
+            frame_best = None
             for score_t, box_t in zip(result["scores"], result["boxes"]):
                 s = float(score_t)
                 bx = box_t.tolist()
                 bw = bx[2] - bx[0]
                 bh = bx[3] - bx[1]
-                # Bo qua box qua nho (< 1% dien tich) hoac qua lon sat vien toan bo khung hinh
-                if bw * bh < 0.01 * (w_img * h_img):
+                # Bo qua box qua nho (< 2% dien tich) hoac chiem toan bo khung hinh (> 82%)
+                if bw * bh < 0.02 * (w_img * h_img) or bw * bh > 0.82 * (w_img * h_img):
                     continue
-                # Tinh khoang cach toi tam anh (uu tien vat the o trung tam)
                 cx = (bx[0] + bx[2]) / 2.0
                 cy = (bx[1] + bx[3]) / 2.0
                 dist_center = np.hypot(cx - w_img / 2.0, cy - h_img / 2.0) / (np.hypot(w_img, h_img) / 2.0)
-                # Diem danh gia ket hop confidence va do trung tam
                 adj_score = s * (1.0 - 0.2 * dist_center)
 
-                if best is None or adj_score > best[0]:
-                    best = (adj_score, int(i), bx, p_try, (w_img, h_img))
+                if frame_best is None or adj_score > frame_best[0]:
+                    frame_best = (adj_score, bx, (w_img, h_img))
 
-        if best is not None:
+            if frame_best is not None:
+                adj_s, rbx, (w_img, h_img) = frame_best
+                bw = rbx[2] - rbx[0]
+                bh = rbx[3] - rbx[1]
+                # Mo rong nhe dinh (top) va 2 ben de bao toan quai xach, mo rong day 3.5% de om tron tem dan trang
+                bot_pad = max(pad_frac, 0.035) + pad_bottom
+                pbox = [
+                    max(0.0, rbx[0] - (pad_frac + pad_bottom * 0.4) * bw),
+                    max(0.0, rbx[1] - max(pad_frac, 0.025) * bh),
+                    min(float(w_img), rbx[2] + (pad_frac + pad_bottom * 0.4) * bw),
+                    min(float(h_img), rbx[3] + bot_pad * bh),
+                ]
+                if adj_s >= 0.30:
+                    keyframe_boxes[int(i)] = pbox
+                if best is None or adj_s > best[0]:
+                    best = (adj_s, int(i), pbox, rbx, p_try)
+
+        if best is not None and len(keyframe_boxes) >= 2:
             break
 
     del model, processor
@@ -111,26 +130,16 @@ def _detect_box(frames_dir: Path, frame_files: list[str], cfg_m: dict):
             'Thu truyen --prompt "<ten_vat_the>" hoac giam box_threshold trong configs/default.yaml.'
         )
 
-    score, frame_idx, raw_box, prompt_used, (w_img, h_img) = best
-
-    # Mo rong nhe bounding box (padding) de bao toan cac vien cong, tai, goc vat the
-    bw = raw_box[2] - raw_box[0]
-    bh = raw_box[3] - raw_box[1]
-    pad_bottom = float(cfg_m.get("base_pad_bottom_frac", 0.0))
-
-    padded_box = [
-        max(0.0, raw_box[0] - (pad_frac + pad_bottom * 0.4) * bw),
-        max(0.0, raw_box[1] - pad_frac * bh),
-        min(float(w_img), raw_box[2] + (pad_frac + pad_bottom * 0.4) * bw),
-        min(float(h_img), raw_box[3] + (pad_frac + pad_bottom) * bh),
-    ]
+    score, frame_idx, padded_box, raw_box, prompt_used = best
+    if frame_idx not in keyframe_boxes:
+        keyframe_boxes[frame_idx] = padded_box
 
     extra_msg = f", base_pad={pad_bottom:.0%}" if pad_bottom > 0 else ""
     print(
-        f"[Buoc 2] Nhan dien thanh cong '{prompt_used}' tren {frame_files[frame_idx]}: "
-        f"score={score:.2f}, box={[round(v, 1) for v in padded_box]} (pad={pad_frac:.0%}{extra_msg})"
+        f"[Buoc 2] Nhan dien thanh cong '{prompt_used}' tren {len(keyframe_boxes)} keyframes "
+        f"(tot nhat: {frame_files[frame_idx]}, score={score:.2f}, box={[round(v, 1) for v in padded_box]}{extra_msg})"
     )
-    return frame_idx, padded_box, raw_box
+    return frame_idx, padded_box, raw_box, keyframe_boxes
 
 
 def _build_sam2_prompts(
@@ -168,22 +177,22 @@ def _build_sam2_prompts(
         [cx, max(y1 + 5, cy - 0.18 * bh)],
         [max(x1 + 5, cx - 0.18 * bw), cy],
         [min(x2 - 5, cx + 0.18 * bw), cy],
+        [cx, min(y2 - 10, cy + 0.28 * bh)], # Diem mo neo o nua duoi (bao ve tem dan/nhan trang khoi bi khoet lo)
     ]
+    # Chi dat diem am STRICTLY ben duoi bounding box (khong dat ben trong [y1, y2] vat the)
+    # de tranh diem am chem thung mat vat the (nhu hop pingpong co tem trang va nap cam)
     cand_neg = [
-        [x1 + 0.08 * bw, y2 - 0.05 * bh],
-        [x2 - 0.08 * bw, y2 - 0.05 * bh],
-        [x1 + 0.20 * bw, y2 - 0.03 * bh],
-        [x2 - 0.20 * bw, y2 - 0.03 * bh],
-        [cx, min(h_img - 5, y2 + 0.06 * bh)],
-        [x1 + 0.25 * bw, min(h_img - 5, y2 + 0.06 * bh)],
-        [x2 - 0.25 * bw, min(h_img - 5, y2 + 0.06 * bh)],
+        [cx, min(h_img - 5, y2 + 0.05 * bh)],
+        [x1 + 0.20 * bw, min(h_img - 5, y2 + 0.05 * bh)],
+        [x2 - 0.20 * bw, min(h_img - 5, y2 + 0.05 * bh)],
+        [cx, min(h_img - 5, y2 + 0.08 * bh)],
     ]
     neg_pts = []
     for px, py in cand_neg:
         ix = int(np.clip(px, 0, w_img - 1))
         iy = int(np.clip(py, 0, h_img - 1))
         dist = float(np.linalg.norm((lab[iy, ix] - center_mean) / center_std))
-        if dist > 2.0 or py > y2:
+        if dist > 1.8 or py > y2 + 2:
             neg_pts.append([px, py])
 
     all_pts = np.array(pos_pts + neg_pts, dtype=np.float32)
@@ -199,14 +208,17 @@ def run(sample_name: str, cfg: dict) -> None:
     if not frame_files:
         raise FileNotFoundError(f"Khong co frame trong {frames_dir}, chay Buoc 1 truoc.")
 
-    anchor_idx, box, raw_box = _detect_box(frames_dir, frame_files, m)
+    anchor_idx, box, raw_box, keyframe_boxes = _detect_box(frames_dir, frame_files, m)
     pad_bottom = float(m.get("base_pad_bottom_frac", 0.0))
-    prompt_str = str(m.get("prompt", "object")).strip().lower()
-    prefix = sample_name.split("_")[0].lower()
-    is_box = prefix in ("box", "carton", "cube") or "box" in prompt_str
-    pts_prompt, lbl_prompt = _build_sam2_prompts(
-        frames_dir / frame_files[anchor_idx], raw_box, pad_bottom, is_box=is_box
-    )
+    use_point_refinement = bool(m.get("use_point_refinement", False))
+    pts_prompt, lbl_prompt = (None, None)
+    if use_point_refinement:
+        prompt_str = str(m.get("prompt", "object")).strip().lower()
+        prefix = sample_name.split("_")[0].lower()
+        is_box = prefix in ("box", "carton", "cube") or "box" in prompt_str
+        pts_prompt, lbl_prompt = _build_sam2_prompts(
+            frames_dir / frame_files[anchor_idx], raw_box, pad_bottom, is_box=is_box
+        )
 
     from sam2.build_sam import build_sam2_video_predictor
 
@@ -220,50 +232,115 @@ def run(sample_name: str, cfg: dict) -> None:
 
     predictor = build_sam2_video_predictor(m["sam2_config"], m["sam2_checkpoint"], device=DEVICE)
     state = predictor.init_state(video_path=str(vframes_dir))
-    predictor.add_new_points_or_box(
-        inference_state=state,
-        frame_idx=anchor_idx,
-        obj_id=1,
-        box=np.array(box, dtype=np.float32),
-        points=pts_prompt,
-        labels=lbl_prompt,
-    )
+
+    # Dang ky tat ca Keyframe Focus Boxes (Whole-Object Box Mode) de giu tron ven cac chi tiet cung mau
+    # (nhu quai xach den trung mau man hinh phia sau) va khong bi troi mask khi xoay 6 mat
+    for k_idx, k_box in sorted(keyframe_boxes.items()):
+        predictor.add_new_points_or_box(
+            inference_state=state,
+            frame_idx=k_idx,
+            obj_id=1,
+            box=np.array(k_box, dtype=np.float32),
+            points=pts_prompt if k_idx == anchor_idx else None,
+            labels=lbl_prompt if k_idx == anchor_idx else None,
+        )
 
     masks_dir = sdir / "masks"
     masks_dir.mkdir(exist_ok=True)
     for old in masks_dir.glob("frame_*.png"):
         old.unlink()
 
+    cutouts_dir = sdir / "cutouts"
+    cutouts_dir.mkdir(exist_ok=True)
+    for old in cutouts_dir.glob("frame_*.jpg"):
+        old.unlink()
+
     dilate_px = m.get("dilate_px", 0)
     kernel_dilate = np.ones((dilate_px * 2 + 1, dilate_px * 2 + 1), np.uint8) if dilate_px > 0 else None
-    # Kernel dong lo nho do loa sang/phan chieu tren be mat cong
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Kernel 3x3 dong lo kim do loa sang ma van giu nguyen khe ho kien truc (nhu lo luon tay quai xach)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     def _save(frame_idx: int, mask_logits: torch.Tensor) -> None:
         raw = (mask_logits[0] > 0.0).cpu().numpy()  # obj duy nhat -> [0]; shape (1, H, W)
         mask = raw[0].astype(np.uint8) * 255
-        # Giu thanh phan lien thong lon nhat (loai bo manh roi rac tren sach/nen)
-        num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        # Giu thanh phan chinh va cac chi tiet cung vat the (quai xach, chot nap >= 1.5% dien tich cum chinh)
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 2:
-            largest_lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-            mask = np.where(labels_im == largest_lbl, 255, 0).astype(np.uint8)
-        # Bit lo nho ben trong vat the do bong sang
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            largest_lbl = 1 + int(np.argmax(areas))
+            max_area = float(areas[largest_lbl - 1])
+            lx = stats[largest_lbl, cv2.CC_STAT_LEFT]
+            ly = stats[largest_lbl, cv2.CC_STAT_TOP]
+            lw = stats[largest_lbl, cv2.CC_STAT_WIDTH]
+            lh = stats[largest_lbl, cv2.CC_STAT_HEIGHT]
+            keep_lbls = [largest_lbl]
+            for lbl in range(1, num_labels):
+                if lbl == largest_lbl:
+                    continue
+                area_c = float(stats[lbl, cv2.CC_STAT_AREA])
+                cx_c, cy_c = centroids[lbl]
+                # Giu cac chi tiet phu (nhu quai xach/chot) nam gan/trong pham vi vat the chinh
+                if area_c >= 0.015 * max_area and (lx - 0.1 * lw <= cx_c <= lx + 1.1 * lw) and (ly - 0.35 * lh <= cy_c <= ly + 1.1 * lh):
+                    keep_lbls.append(lbl)
+            mask = np.where(np.isin(labels_im, keep_lbls), 255, 0).astype(np.uint8)
+
+        # Lap day lo hong ben trong vat the (Hole filling: bao ve tem trang, nhan mac, vung loa sang)
+        hm, wm = mask.shape
+        padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        fill_mask = np.zeros((hm + 4, wm + 4), np.uint8)
+        inv = cv2.bitwise_not(padded)
+        cv2.floodFill(inv, fill_mask, (0, 0), 0)
+        holes = inv[1:-1, 1:-1]
+        mask = cv2.bitwise_or(mask, holes)
+
+        # Lap lom day ho / cua vom o mep duoi (Bottom arch filling: bao ve tem dan trang sat day khoi bi khoet lo)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw >= 30 and bh >= 30:
+                c_pts = c.reshape(-1, 2)
+                left_pts = c_pts[(c_pts[:, 0] >= bx) & (c_pts[:, 0] <= bx + 0.25 * bw)]
+                right_pts = c_pts[(c_pts[:, 0] >= bx + 0.75 * bw) & (c_pts[:, 0] <= bx + bw)]
+                if len(left_pts) > 0 and len(right_pts) > 0:
+                    p_left = left_pts[np.argmax(left_pts[:, 1])]
+                    p_right = right_pts[np.argmax(right_pts[:, 1])]
+                    bridge_mask = mask.copy()
+                    cv2.line(bridge_mask, tuple(p_left), tuple(p_right), 255, thickness=max(3, int(0.015 * bh)))
+                    padded_b = cv2.copyMakeBorder(bridge_mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+                    fill_mask_b = np.zeros((hm + 4, wm + 4), np.uint8)
+                    inv_b = cv2.bitwise_not(padded_b)
+                    cv2.floodFill(inv_b, fill_mask_b, (0, 0), 0)
+                    trapped_holes = inv_b[1:-1, 1:-1]
+                    if int(np.sum(trapped_holes > 0)) >= 0.01 * (bw * bh):
+                        mask = cv2.bitwise_or(bridge_mask, trapped_holes)
+
+        # Bit lo kim nho ben trong vat the do bong sang
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
         if kernel_dilate is not None:
             mask = cv2.dilate(mask, kernel_dilate)
         cv2.imwrite(str(masks_dir / frame_files[frame_idx].replace(".jpg", ".png")), mask)
 
-    # Lan truyen xuoi tu anchor den cuoi video, roi lan truyen nguoc tu anchor ve dau
+        # Luu anh Focus Cutout (cat tach ro hinh dang vat the, loai bo hoan toan nen)
+        orig_img = cv2.imread(str(frames_dir / frame_files[frame_idx]))
+        if orig_img is not None:
+            cutout = cv2.bitwise_and(orig_img, orig_img, mask=mask)
+            cv2.imwrite(str(cutouts_dir / frame_files[frame_idx]), cutout, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    first_anchor = min(keyframe_boxes.keys())
+    # Lan truyen xuoi tu keyframe dau tien den cuoi video
     for frame_idx, _obj_ids, mask_logits in tqdm(
-        predictor.propagate_in_video(state, start_frame_idx=anchor_idx, reverse=False),
+        predictor.propagate_in_video(state, start_frame_idx=first_anchor, reverse=False),
         desc="Buoc 2b: lan truyen xuoi",
     ):
         _save(frame_idx, mask_logits)
-    for frame_idx, _obj_ids, mask_logits in tqdm(
-        predictor.propagate_in_video(state, start_frame_idx=anchor_idx, reverse=True),
-        desc="Buoc 2c: lan truyen nguoc",
-    ):
-        _save(frame_idx, mask_logits)
+    # Neu keyframe dau tien > 0, lan truyen nguoc ve dau video
+    if first_anchor > 0:
+        for frame_idx, _obj_ids, mask_logits in tqdm(
+            predictor.propagate_in_video(state, start_frame_idx=first_anchor, reverse=True),
+            desc="Buoc 2c: lan truyen nguoc",
+        ):
+            _save(frame_idx, mask_logits)
 
     shutil.rmtree(vframes_dir, ignore_errors=True)
-    print(f"[Buoc 2] Da tao {len(frame_files)} mask -> {masks_dir}")
+    print(f"[Buoc 2] Da tao {len(frame_files)} Focus Mask -> {masks_dir} & Cutouts -> {cutouts_dir}")
