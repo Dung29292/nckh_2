@@ -7,7 +7,6 @@ from pathlib import Path
 import cv2
 
 from . import paths
-from .mobile_camera import MobileVideoCapture
 
 
 # ---------------------------------------------------------------- mau co san
@@ -42,8 +41,18 @@ def _is_mobile_source(camera) -> bool:
     return isinstance(camera, str) and camera.strip().lower() in ("mobile", "phone", "qr")
 
 
+def _is_mobile_cap(cap) -> bool:
+    return getattr(cap, "is_mobile", False) or cap.__class__.__name__ == "MobileVideoCapture"
+
+
 def _open_camera(camera, width: int, height: int, fps: int, rec_cfg: dict | None = None):
     if _is_mobile_source(camera):
+        try:
+            from .mobile_camera import MobileVideoCapture
+        except ImportError as exc:
+            print(f"Khong the mo Camera dien thoai do thieu thu vien ({exc}).")
+            print("Goi y: chay 'poetry install' hoac 'pip install flask simple-websocket cryptography psutil' de dung tinh nang nay.")
+            return cv2.VideoCapture()
         rec_cfg = rec_cfg or {}
         return MobileVideoCapture(
             width=width,
@@ -163,7 +172,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
     last_mobile_frame = None
 
     def _print_banner() -> None:
-        if isinstance(cap, MobileVideoCapture):
+        if _is_mobile_cap(cap):
             cap.print_connection_info()
         else:
             print(f"Camera [{current_cam}] {w}x{h} @ {fps:.0f}fps.")
@@ -188,7 +197,8 @@ def record_video(name: str | None, cfg: dict) -> str | None:
     _print_banner()
 
     while True:
-        is_mobile = isinstance(cap, MobileVideoCapture)
+        is_mobile = _is_mobile_cap(cap)
+        new_frame_arrived = False
         if is_mobile:
             if cap.pop_command() == "toggle_record":
                 key_trigger_record = True
@@ -205,6 +215,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             else:
                 last_mobile_frame = frame
                 frame_ready = True
+                new_frame_arrived = True
                 # Dong bo kich thuoc thuc te khi dien thoai xoay ngang/doc luc chua quay
                 fh, fw = frame.shape[:2]
                 if writer is None and (fw != w or fh != h):
@@ -216,9 +227,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 print("Mat tin hieu camera.")
                 break
             frame_ready = True
+            new_frame_arrived = True
 
         if frame_ready:
-            if writer is not None:
+            if writer is not None and new_frame_arrived:
                 write_frame = frame
                 if frame.shape[1] != w or frame.shape[0] != h:
                     write_frame = cv2.resize(frame, (w, h))
@@ -238,7 +250,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             else:
                 hint = f"Cam [{current_cam}] {w}x{h} | R: Record | M: Mobile QR | C: Switch Cam | Q: Quit"
                 cv2.putText(view, hint, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-            cv2.imshow("nckh_2 - record", cv2.resize(view, (960, max(180, int(960 * h / max(w, 1))))))
+            scale = min(960 / max(w, 1), 540 / max(h, 1))
+            disp_w = max(180, int(w * scale))
+            disp_h = max(180, int(h * scale))
+            cv2.imshow("nckh_2 - record", cv2.resize(view, (disp_w, disp_h)))
 
         key = cv2.waitKey(1) & 0xFF
         if key_trigger_record or key in (ord("r"), ord("R")):
@@ -305,7 +320,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
     if writer is not None:  # thoat khi dang quay -> van luu va dong bo FPS
         writer.release()
-        if isinstance(cap, MobileVideoCapture):
+        if _is_mobile_cap(cap):
             cap.set_recording_state(False)
         actual_fps = _finalize_recorded_video(
             temp_video_path, video_path, recorded_frames, time.time() - t0, fps, (w, h)
