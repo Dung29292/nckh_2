@@ -5,6 +5,9 @@ record:
   width: 1920
   height: 1080
   fps: 30
+  mobile_port: 8443             # cong HTTPS/WebSocket mac dinh cho che do Camera dien thoai
+  mobile_ssl: true              # bat HTTPS tu ky de trinh duyet dien thoai cho phep getUserMedia
+  mobile_host_ip: ""            # de trong de tu dong chon IP Wi-Fi/Ethernet LAN
 
 blur_filter:         # Buoc 1
   score_width: 640

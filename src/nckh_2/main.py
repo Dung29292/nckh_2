@@ -40,13 +40,16 @@ MODES = {
 
 def _menu_source(cfg: dict) -> str:
     print("=== nckh_2 - Pha 1 ===")
-    print("  [1] Quay video truc tiep (luu thanh mau moi)")
-    print("  [2] Dung mau co san")
+    print("  [1] Quay video truc tiep (Webcam may tinh -> mau moi)")
+    print("  [2] Quay bang Camera dien thoai (Quet QR / Wi-Fi LAN)")
+    print("  [3] Dung mau co san")
     while True:
-        c = input("Chon 1 hoac 2: ").strip()
+        c = input("Chon 1, 2 hoac 3: ").strip()
         if c == "1":
             return "record"
         if c == "2":
+            return "mobile"
+        if c == "3":
             return "sample"
 
 
@@ -76,9 +79,12 @@ def _resolve_sample(args: argparse.Namespace, cfg: dict, need_source: bool) -> t
         name = choose_sample(cfg["video_file"])
         return "sample", name
 
-    # Buoc can nguon (buoc 1, 2): hoi record hay sample
+    # Buoc can nguon (buoc 1, 2): hoi record, mobile hay sample
     source = args.source or _menu_source(cfg)
-    if source == "record":
+    if source == "mobile":
+        cfg["record"]["camera"] = "mobile"
+        name = record_video(args.name, cfg)
+    elif source == "record":
         name = record_video(args.name, cfg)
     else:
         name = (
@@ -133,10 +139,11 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
 
     ap = argparse.ArgumentParser(description="nckh_2 pipeline")
-    ap.add_argument("--source",  choices=["record", "sample"],
-                    help="nguon du lieu: record = quay moi, sample = mau co san")
+    ap.add_argument("--source",  choices=["record", "mobile", "sample"],
+                    help="nguon du lieu: record = webcam, mobile = camera dien thoai (QR), sample = mau co san")
     ap.add_argument("--name",    help="ten mau")
-    ap.add_argument("--camera",  help="chi so camera hoac URL (ghi de config)")
+    ap.add_argument("--camera",  help="chi so camera, 'mobile', hoac URL (ghi de config)")
+    ap.add_argument("--host-ip", help="ghi de dia chi IP LAN phat QR cho camera dien thoai")
     ap.add_argument("--prompt",  help="tu khoa nhan dien vat the cho Grounded-SAM 2 (ghi de config)")
     ap.add_argument("--mode",    choices=list(MODES),
                     help="che do quay: orbit | turntable")
@@ -158,6 +165,8 @@ def main() -> None:
 
     if args.camera is not None:
         cfg["record"]["camera"] = args.camera
+    if args.host_ip is not None:
+        cfg["record"]["mobile_host_ip"] = args.host_ip
 
     # Xac dinh xem cac buoc se chay co can source/mode khong
     steps_to_run  = set(range(args.start, args.until + 1))
