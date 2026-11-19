@@ -84,12 +84,38 @@ mesh_export:         # Buoc 4
   # --- Can thang dung (Z-up) & dat len mat san (Z=0) ---
   align_upright: true           # tu dong can thang truc Z-up, dua ve goc (0,0) va tiep dat sat san Z=0
 
+completion:              # Hoan thien vung bi che lap theo Prompt + Anh Web (Depth-Free, khong can Depth Anything)
+  mode: "retrieval_guided"      # retrieval_guided (Visual Hull + Web Ref + Biharmonic) | legacy_heuristic
+  prior_backend: "auto"         # auto (Gemini neu co GEMINI_API_KEY, nguoc lai heuristic) | gemini | heuristic
+  enable_web_retrieval: true    # tim & xac thuc anh tham chieu tren mang + thu muc web_refs/manual/
+  web_provider: "duckduckgo"    # duckduckgo | google_cse | serpapi | manual_only
+  web_online: true              # false: chi dung cache & anh tha tay trong web_refs/manual/
+  web_max_per_query: 5
+  web_min_verify_score: 0.56    # nguong loc san pham trung khop (Visual Feature + Lab Color)
+  visual_hull_res: 64           # do phan giai luoi voxel Visual Hull tu mask Buoc 2
+  visual_hull_pad_frac: 0.28
+  visual_hull_consistency: 0.80
+  use_symmetry: true            # tu dong noi suy doi xung (chi nhan neu ICP overlap >= symmetry_min_overlap)
+  symmetry_min_overlap: 0.72
+  virtual_view_size: 320        # kich thuoc khung hinh camera ao de phat hien & lap lo che khuat
+  inpaint_backend: "fast_guided" # fast_guided (0 VRAM) | diffusers (SD1.5 + ControlNet-Depth fp16)
+  use_gsplat_consolidation: false # bat true de tinh chinh da goc nhin bang gsplat 2DGS/3DGS (~2.5 GB VRAM)
+  gsplat_iters: 120
+
 mesh_refine:             # Buoc 5: Pipeline tinh chinh & lam min chuyen sau (chay doc lap hoac tu dong)
   auto_run: true                # tu dong chay ngay sau buoc 4
   align_upright: true           # bao toan can thang truc va dat sat san Z=0
-  taubin_iter: 45               # so vong Taubin triet tieu song/ranh khong teo the tich
+  smooth_mode: "bilateral_normal" # bilateral_normal (giu sac canh/chi tiet nho) | pymeshlab_twostep | taubin
+  bilateral_normal_iter: 6      # so vong loc phap tuyen song phuong (anisotropic)
+  bilateral_vertex_iter: 20     # so vong can chinh dinh theo phap tuyen da loc
+  bilateral_sigma_s_scale: 1.5  # ban kinh khong gian (boi so do dai canh trung binh)
+  bilateral_sigma_r: 0.38       # nguong bao ve canh sac (nho hon -> canh/khoa/quai cang sac)
+  bilateral_anchor_weight: 0.06 # luc neo giu dinh quan sat thuc te (w=1.0) khong bi troi/mo
+  detail_residual_transfer: false # bat true neu vat co chi tiet khac noi sieu nong can doi chieu lai MVS
+  detail_residual_strength: 0.25
+  taubin_iter: 45               # dung khi smooth_mode: "taubin"
   taubin_lambda: 0.5
   taubin_mu: -0.53
-  polish_iter: 4                # so vong danh bong lam muot be mat (simple polish)
+  polish_iter: 4                # dung khi smooth_mode: "taubin"
   subdivide: false              # bat true neu can tang mat do luoi truoc khi lam min
   subdivide_method: "midpoint"  # midpoint hoac loop

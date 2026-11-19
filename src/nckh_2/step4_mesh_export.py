@@ -1178,8 +1178,85 @@ def run(sample_name: str, cfg: dict) -> None:
 
     obj_path = out_dir / f"{sample_name}.obj"
     clean_ply = out_dir / "point_cloud_clean.ply"
+    conf_npy = out_dir / "point_confidence.npy"
 
-    if interp_enabled and is_box_target:
+    comp_cfg = cfg.get("completion", {})
+    comp_mode = str(comp_cfg.get("mode", "retrieval_guided")).strip().lower()
+
+    if comp_mode == "retrieval_guided":
+        from .completion.inpaint_fuse import run_depth_free_completion
+
+        print("[Buoc 4] Hoan thien 3D theo Prompt + Anh tham chieu Web (Depth-Free Visual Hull + Biharmonic)...")
+        res = run_depth_free_completion(sample_name, paths.sample_dir(sample_name), pc, cfg)
+        pc = res.point_cloud
+
+        # Can he truc Z-up dong nhat cho CA point cloud va mesh de khop 100% trong Blender va Buoc 5
+        pts_c = np.asarray(pc.points, dtype=np.float64)
+        cent = np.median(pts_c, axis=0)
+        centered = pts_c - cent
+        eigvals, eigvecs = np.linalg.eigh(np.cov(centered, rowvar=False))
+        ratio_01 = float(eigvals[1] / max(eigvals[0], 1e-8))
+        ratio_12 = float(eigvals[2] / max(eigvals[1], 1e-8))
+        if ratio_01 < 1.35 and ratio_12 > 1.25:
+            R_up = np.vstack([eigvecs[:, 0], eigvecs[:, 1], eigvecs[:, 2]])
+        else:
+            R_up = np.vstack([eigvecs[:, 2], eigvecs[:, 1], eigvecs[:, 0]])
+        if np.linalg.det(R_up) < 0:
+            R_up[0] *= -1.0
+
+        pts_up = centered @ R_up.T
+        norms_up = np.asarray(pc.normals, dtype=np.float64) @ R_up.T
+        # Neu vat the co nap mau cam hoac vom tren o phia -Z -> lat nguoc de +Z huong len tren
+        cols_up = np.asarray(pc.colors, dtype=np.float64) if pc.has_colors() else None
+        if cols_up is not None:
+            is_orange = (cols_up[:, 0] > 0.50) & (cols_up[:, 1] < 0.55) & (cols_up[:, 2] < 0.40)
+            is_dark = (cols_up[:, 0] < 0.35) & (cols_up[:, 1] < 0.35) & (cols_up[:, 2] < 0.35)
+            if np.any(is_orange) and np.any(is_dark):
+                if np.median(pts_up[is_orange, 2]) < np.median(pts_up[is_dark, 2]):
+                    pts_up[:, 2] *= -1.0
+                    pts_up[:, 0] *= -1.0
+                    norms_up[:, 2] *= -1.0
+                    norms_up[:, 0] *= -1.0
+
+        tx = 0.5 * (pts_up[:, 0].min() + pts_up[:, 0].max())
+        ty = 0.5 * (pts_up[:, 1].min() + pts_up[:, 1].max())
+        tz = float(np.percentile(pts_up[:, 2], 1))
+        pts_up[:, 0] -= tx
+        pts_up[:, 1] -= ty
+        pts_up[:, 2] -= tz
+
+        pc.points = o3d.utility.Vector3dVector(pts_up)
+        pc.normals = o3d.utility.Vector3dVector(norms_up)
+
+        print("[Buoc 4] Screened Poisson surface reconstruction (giu nguyen chi tiet truoc khi loc song phuong)...")
+        e_poi = {**e, "smooth_iter": 0, "polish_iter": 0}
+        mesh = _poisson_mesh(pc, e_poi)
+        if e.get("make_watertight", False):
+            mesh = _make_watertight(mesh)
+
+        # Dong bo tuyet doi goc (X=0, Y=0, Z>=0) cho CA point_cloud_clean.ply va mesh
+        mv = np.asarray(mesh.vertices)
+        if len(mv) > 0:
+            dx = 0.5 * (mv[:, 0].min() + mv[:, 0].max())
+            dy = 0.5 * (mv[:, 1].min() + mv[:, 1].max())
+            dz = float(mv[:, 2].min())
+            mv[:, 0] -= dx
+            mv[:, 1] -= dy
+            mv[:, 2] -= dz
+            mesh.vertices = o3d.utility.Vector3dVector(mv)
+            mesh.compute_triangle_normals()
+            mesh.compute_vertex_normals()
+
+            pts_up[:, 0] -= dx
+            pts_up[:, 1] -= dy
+            pts_up[:, 2] -= dz
+            pc.points = o3d.utility.Vector3dVector(pts_up)
+
+        o3d.io.write_point_cloud(str(clean_ply), pc)
+        np.save(str(conf_npy), res.confidence.astype(np.float32))
+        print(f"  da luu point cloud hoan thien + confidence -> {clean_ply.name}, {conf_npy.name}")
+
+    elif interp_enabled and is_box_target:
         # Voi hinh hop: goi truc tiep _complete_box_geometry de giu tron ven cum chu mat truoc & vien canh
         print("[Buoc 4] Loc nhieu & Noi suy 6 mat hinh hop (Orthogonal RANSAC + Surface Interpolation)...")
         pc, mesh = _complete_box_geometry(pc, e)
