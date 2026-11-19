@@ -268,9 +268,9 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
   <title>Mobile Camera Stream - NCKH 2</title>
   <style>
     :root {
-      --bg: #0b0f17;
-      --panel: rgba(17, 24, 39, 0.82);
-      --border: rgba(255, 255, 255, 0.14);
+      --bg: #090d16;
+      --panel: rgba(15, 23, 42, 0.85);
+      --border: rgba(255, 255, 255, 0.16);
       --accent: #3b82f6;
       --danger: #ef4444;
       --success: #10b981;
@@ -278,27 +278,118 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       --text: #f8fafc;
       --muted: #94a3b8;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
     html, body {
-      width: 100%; height: 100dvh; overflow: hidden;
-      background: var(--bg); color: var(--text);
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100dvh;
+      overflow: hidden;
+      touch-action: none;
+      background: var(--bg);
+      color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     .stage {
-      position: relative; width: 100%; height: 100dvh;
-      display: flex; align-items: center; justify-content: center;
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       background: #000;
+      touch-action: none;
     }
     video {
-      width: 100%; height: 100%; object-fit: contain;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
       background: #000;
+      pointer-events: none;
     }
+
+    /* 3D Capture Guide Overlay */
+    .guide-overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 5;
+      transition: opacity 0.25s;
+    }
+    .guide-overlay.hidden { opacity: 0; }
+    .guide-box {
+      position: relative;
+      width: min(74vw, 55vh);
+      height: min(74vw, 55vh);
+      border: 1px dashed rgba(255, 255, 255, 0.35);
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .corner {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      border-color: #60a5fa;
+      border-style: solid;
+    }
+    .corner.tl { top: -2px; left: -2px; border-width: 3px 0 0 3px; border-top-left-radius: 20px; }
+    .corner.tr { top: -2px; right: -2px; border-width: 3px 3px 0 0; border-top-right-radius: 20px; }
+    .corner.bl { bottom: -2px; left: -2px; border-width: 0 0 3px 3px; border-bottom-left-radius: 20px; }
+    .corner.br { bottom: -2px; right: -2px; border-width: 0 3px 3px 0; border-bottom-right-radius: 20px; }
+    .crosshair {
+      width: 20px;
+      height: 20px;
+      position: relative;
+    }
+    .crosshair::before, .crosshair::after {
+      content: "";
+      position: absolute;
+      background: rgba(255, 255, 255, 0.55);
+    }
+    .crosshair::before { top: 9px; left: 0; right: 0; height: 2px; }
+    .crosshair::after { left: 9px; top: 0; bottom: 0; width: 2px; }
+    .guide-label {
+      position: absolute;
+      bottom: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      color: rgba(255, 255, 255, 0.75);
+      background: rgba(15, 23, 42, 0.65);
+      backdrop-filter: blur(6px);
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+
+    /* Top HUD */
     .hud-top {
-      position: absolute; top: env(safe-area-inset-top, 12px); left: 12px; right: 12px;
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
-      padding: 10px 14px; border-radius: 14px;
-      background: var(--panel); backdrop-filter: blur(10px);
-      border: 1px solid var(--border); font-size: 13px;
+      position: absolute;
+      top: env(safe-area-inset-top, 12px);
+      left: 12px;
+      right: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 14px;
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      font-size: 13px;
+      z-index: 10;
     }
     .status-group { display: flex; align-items: center; gap: 8px; font-weight: 600; }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); }
@@ -306,8 +397,8 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     .dot.err { background: var(--danger); }
     .rec-pill {
       display: none; align-items: center; gap: 6px;
-      padding: 4px 10px; border-radius: 999px;
-      background: rgba(239, 68, 68, 0.2); border: 1px solid var(--danger);
+      padding: 3px 10px; border-radius: 999px;
+      background: rgba(239, 68, 68, 0.25); border: 1px solid var(--danger);
       color: #fecaca; font-weight: 700; font-size: 12px;
       animation: pulse 1.2s infinite;
     }
@@ -315,41 +406,132 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
     .stats { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 
-    .hud-bottom {
-      position: absolute; bottom: calc(env(safe-area-inset-bottom, 12px) + 12px); left: 12px; right: 12px;
-      display: flex; flex-direction: column; gap: 10px;
-      padding: 12px; border-radius: 18px;
-      background: var(--panel); backdrop-filter: blur(12px);
+    /* Zoom Pill */
+    .zoom-pill {
+      position: absolute;
+      bottom: calc(env(safe-area-inset-bottom, 12px) + 115px);
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(15, 23, 42, 0.8);
+      backdrop-filter: blur(10px);
+      padding: 4px 6px;
+      border-radius: 999px;
       border: 1px solid var(--border);
+      z-index: 10;
+    }
+    .zoom-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      padding: 0;
+    }
+    .zoom-btn.active {
+      background: rgba(255, 255, 255, 0.2);
+      color: #60a5fa;
+    }
+
+    /* Bottom HUD */
+    .hud-bottom {
+      position: absolute;
+      bottom: calc(env(safe-area-inset-bottom, 12px) + 8px);
+      left: 12px;
+      right: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 18px;
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      z-index: 10;
     }
     .controls-row {
-      display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1.6fr;
+      gap: 6px;
     }
     .settings-row {
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
-      font-size: 12px; color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
     }
     button, select {
-      appearance: none; border: 1px solid var(--border); border-radius: 12px;
-      background: rgba(255, 255, 255, 0.08); color: var(--text);
-      padding: 11px 8px; font-size: 13px; font-weight: 600;
-      cursor: pointer; text-align: center; transition: transform 0.1s, background 0.15s;
+      appearance: none;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      padding: 10px 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      transition: transform 0.1s, background 0.15s;
     }
     button:active { transform: scale(0.96); }
     button.active { background: var(--accent); border-color: #60a5fa; }
-    button.rec-btn { background: rgba(239, 68, 68, 0.25); border-color: var(--danger); color: #fee2e2; }
-    button.rec-btn.recording { background: var(--danger); color: #fff; }
+    button.rec-btn {
+      background: rgba(239, 68, 68, 0.25);
+      border-color: var(--danger);
+      color: #fee2e2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      font-weight: 700;
+    }
+    button.rec-btn .rec-icon {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--danger);
+      transition: border-radius 0.2s;
+    }
+    button.rec-btn.recording {
+      background: var(--danger);
+      color: #fff;
+    }
+    button.rec-btn.recording .rec-icon {
+      border-radius: 2px;
+      background: #fff;
+    }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    select { padding: 7px 10px; font-size: 12px; text-align: left; flex: 1; max-width: 48%; }
+    select { padding: 6px 8px; font-size: 11px; text-align: left; flex: 1; max-width: 49%; }
 
     .banner-err {
-      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
-      padding: 24px; background: rgba(11, 15, 23, 0.94); z-index: 20; text-align: center;
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(9, 13, 22, 0.94);
+      z-index: 30;
+      text-align: center;
     }
     .banner-err.show { display: flex; }
     .banner-box {
-      max-width: 400px; padding: 20px; border-radius: 16px;
-      background: #111827; border: 1px solid var(--danger);
+      max-width: 400px;
+      padding: 20px;
+      border-radius: 16px;
+      background: #111827;
+      border: 1px solid var(--danger);
     }
     .banner-box h3 { color: #fca5a5; margin-bottom: 8px; }
     .banner-box p { color: #cbd5e1; font-size: 14px; line-height: 1.5; margin-bottom: 14px; }
@@ -359,39 +541,62 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
   <div class="stage">
     <video id="video" autoplay playsinline muted></video>
 
+    <!-- 3D Capture Guide Overlay -->
+    <div id="guideOverlay" class="guide-overlay">
+      <div class="guide-box">
+        <div class="corner tl"></div>
+        <div class="corner tr"></div>
+        <div class="corner bl"></div>
+        <div class="corner br"></div>
+        <div class="crosshair"></div>
+        <span class="guide-label">GIỮ VẬT THỂ TRONG KHUNG 3D</span>
+      </div>
+    </div>
+
+    <!-- Top HUD -->
     <div class="hud-top">
       <div class="status-group">
         <span id="statusDot" class="dot"></span>
-        <span id="statusText">Dang ket noi...</span>
+        <span id="statusText">Đang kết nối...</span>
       </div>
       <div id="recBadge" class="rec-pill">● REC</div>
       <div id="statsText" class="stats">0 fps | 0 KB</div>
     </div>
 
+    <!-- Hardware Zoom Pill -->
+    <div id="zoomPill" class="zoom-pill">
+      <button id="zoom1xBtn" type="button" class="zoom-btn active">1x</button>
+      <button id="zoom2xBtn" type="button" class="zoom-btn">2x</button>
+    </div>
+
+    <!-- Bottom HUD -->
     <div class="hud-bottom">
       <div class="settings-row">
-        <select id="resSelect" title="Do phan giai">
-          <option value="1280x720" selected>720p (Nhanh / On dinh)</option>
-          <option value="1920x1080">1080p (Chi tiet cao)</option>
-          <option value="960x540">540p (Wi-Fi yeu)</option>
+        <select id="resSelect" title="Độ phân giải">
+          <option value="1280x720" selected>720p (Nhanh / Ổn định)</option>
+          <option value="1920x1080">1080p (Chi tiết cao)</option>
+          <option value="960x540">540p (Wi-Fi yếu)</option>
         </select>
-        <select id="cameraSelect" title="Chon ong kinh">
-          <option value="">Mac dinh: Camera sau</option>
+        <select id="cameraSelect" title="Chọn ống kính">
+          <option value="">Mặc định: Camera sau</option>
         </select>
       </div>
       <div class="controls-row">
-        <button id="switchBtn" type="button">🔄 Doi cam</button>
-        <button id="torchBtn" type="button">🔦 Den Flash</button>
-        <button id="pauseBtn" type="button">⏸ Tam dung</button>
-        <button id="recBtn" type="button" class="rec-btn">⏺ Quay/Dung</button>
+        <button id="switchBtn" type="button">🔄 Đổi cam</button>
+        <button id="torchBtn" type="button">🔦 Flash</button>
+        <button id="guideBtn" type="button" class="active">📐 Khung</button>
+        <button id="recBtn" type="button" class="rec-btn">
+          <span class="rec-icon"></span>
+          <span id="recBtnText">Quay</span>
+        </button>
       </div>
     </div>
 
     <div id="errBanner" class="banner-err">
       <div class="banner-box">
-        <h3 id="errTitle">Khong mo duoc Camera</h3>
+        <h3 id="errTitle">Không mở được Camera</h3>
         <p id="errMsg"></p>
-        <button id="retryBtn" type="button" class="active" style="width:100%">Thu lai</button>
+        <button id="retryBtn" type="button" class="active" style="width:100%">Thử lại</button>
       </div>
     </div>
   </div>
@@ -409,8 +614,12 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     const cameraSelect = document.getElementById("cameraSelect");
     const switchBtn = document.getElementById("switchBtn");
     const torchBtn = document.getElementById("torchBtn");
-    const pauseBtn = document.getElementById("pauseBtn");
+    const guideBtn = document.getElementById("guideBtn");
+    const guideOverlay = document.getElementById("guideOverlay");
     const recBtn = document.getElementById("recBtn");
+    const recBtnText = document.getElementById("recBtnText");
+    const zoom1xBtn = document.getElementById("zoom1xBtn");
+    const zoom2xBtn = document.getElementById("zoom2xBtn");
     const errBanner = document.getElementById("errBanner");
     const errTitle = document.getElementById("errTitle");
     const errMsg = document.getElementById("errMsg");
@@ -428,6 +637,11 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     let streaming = true;
     let inFlightBlob = false;
     let wakeLock = null;
+
+    let zoomCaps = null;
+    let currentZoom = 1.0;
+    let touchStartDist = 0;
+    let baseZoom = 1.0;
 
     const TARGET_FPS = 30;
     const JPEG_QUALITY = 0.84;
@@ -467,6 +681,18 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    function applyZoom(z) {
+      if (!stream || !zoomCaps) return;
+      const clamped = Math.min(Math.max(z, zoomCaps.min), zoomCaps.max);
+      currentZoom = clamped;
+      const track = stream.getVideoTracks()[0];
+      if (track && track.applyConstraints) {
+        track.applyConstraints({ advanced: [{ zoom: clamped }] }).catch(() => {});
+      }
+      if (zoom1xBtn) zoom1xBtn.classList.toggle("active", Math.abs(currentZoom - 1.0) < 0.2);
+      if (zoom2xBtn) zoom2xBtn.classList.toggle("active", Math.abs(currentZoom - 2.0) < 0.2);
+    }
+
     async function populateCameraList() {
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
@@ -497,8 +723,8 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       hideError();
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         showError(
-          "Trinh duyet chan Camera",
-          "Can truy cap bang HTTPS (hoac localhost). Hay kiem tra lai duong dan https:// va xac nhan chung chi SSL."
+          "Trình duyệt chặn Camera",
+          "Cần truy cập bằng HTTPS (hoặc localhost). Hãy kiểm tra lại đường dẫn https:// và xác nhận chứng chỉ SSL."
         );
         return;
       }
@@ -520,12 +746,19 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
         const caps = track && track.getCapabilities ? track.getCapabilities() : {};
         torchSupported = Boolean(caps && caps.torch);
         torchBtn.disabled = !torchSupported;
-        torchBtn.textContent = torchSupported ? "🔦 Den Flash" : "🔦 Flash (N/A)";
+        torchBtn.textContent = torchSupported ? "🔦 Flash" : "🔦 Flash (N/A)";
+
+        if (caps && caps.zoom) {
+          zoomCaps = caps.zoom;
+          currentZoom = Math.max(1.0, zoomCaps.min);
+        } else {
+          zoomCaps = null;
+        }
       } catch (err) {
         console.error("getUserMedia error:", err);
         showError(
-          "Khong the mo Camera",
-          `${err.name}: ${err.message}. Hay cap quyen Camera cho trinh duyet va thu lai.`
+          "Không thể mở Camera",
+          `${err.name}: ${err.message}. Hãy cấp quyền Camera cho trình duyệt và thử lại.`
         );
       }
     }
@@ -533,12 +766,12 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     function connectWebSocket() {
       const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${wsProto}//${window.location.host}/ws?token=${encodeURIComponent(TOKEN)}`;
-      setStatus("wait", "Dang ket noi WS...");
+      setStatus("wait", "Đang kết nối PC...");
       ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        setStatus("ok", "Da ket noi PC");
+        setStatus("ok", "Đã kết nối PC");
       };
 
       ws.onmessage = (ev) => {
@@ -548,7 +781,7 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
             if (msg.type === "status" && typeof msg.recording === "boolean") {
               recBadge.classList.toggle("active", msg.recording);
               recBtn.classList.toggle("recording", msg.recording);
-              recBtn.textContent = msg.recording ? "⏹ Dung quay" : "⏺ Quay/Dung";
+              recBtnText.textContent = msg.recording ? "Dừng" : "Quay";
             }
           } catch (_) {}
         }
@@ -559,12 +792,12 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
           setStatus("err", "Sai Session Token");
           return;
         }
-        setStatus("err", "Mat ket noi, thu lai...");
+        setStatus("err", "Mất kết nối, thử lại...");
         setTimeout(connectWebSocket, 1500);
       };
 
       ws.onerror = () => {
-        setStatus("err", "Loi WebSocket");
+        setStatus("err", "Lỗi WebSocket");
       };
     }
 
@@ -603,7 +836,39 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       frameCounter = 0;
     }, 1000);
 
+    // Gestures: Pinch to zoom
+    const stageEl = document.querySelector(".stage");
+    stageEl.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        touchStartDist = Math.hypot(dx, dy);
+        baseZoom = currentZoom;
+      }
+    }, { passive: true });
+
+    stageEl.addEventListener("touchmove", (e) => {
+      if (e.touches.length === 2 && touchStartDist > 0 && zoomCaps) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        const dist = Math.hypot(dx, dy);
+        const factor = dist / touchStartDist;
+        applyZoom(baseZoom * factor);
+      }
+    }, { passive: true });
+
+    zoom1xBtn.addEventListener("click", () => {
+      if ("vibrate" in navigator) navigator.vibrate(20);
+      applyZoom(1.0);
+    });
+
+    zoom2xBtn.addEventListener("click", () => {
+      if ("vibrate" in navigator) navigator.vibrate(20);
+      applyZoom(2.0);
+    });
+
     switchBtn.addEventListener("click", () => {
+      if ("vibrate" in navigator) navigator.vibrate(20);
       selectedDeviceId = "";
       facingMode = facingMode === "environment" ? "user" : "environment";
       startCamera();
@@ -625,20 +890,22 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
         torchOn = !torchOn;
         await track.applyConstraints({ advanced: [{ torch: torchOn }] });
         torchBtn.classList.toggle("active", torchOn);
+        if ("vibrate" in navigator) navigator.vibrate(20);
       } catch (err) {
         torchOn = false;
         torchBtn.classList.remove("active");
-        alert("Khong bat duoc den Flash tren ong kinh nay: " + err.message);
+        alert("Không bật được đèn Flash trên ống kính này: " + err.message);
       }
     });
 
-    pauseBtn.addEventListener("click", () => {
-      streaming = !streaming;
-      pauseBtn.classList.toggle("active", !streaming);
-      pauseBtn.textContent = streaming ? "⏸ Tam dung" : "▶ Tiep tuc";
+    guideBtn.addEventListener("click", () => {
+      guideOverlay.classList.toggle("hidden");
+      guideBtn.classList.toggle("active", !guideOverlay.classList.contains("hidden"));
+      if ("vibrate" in navigator) navigator.vibrate(20);
     });
 
     recBtn.addEventListener("click", () => {
+      if ("vibrate" in navigator) navigator.vibrate(50);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "control", action: "toggle_record" }));
       }

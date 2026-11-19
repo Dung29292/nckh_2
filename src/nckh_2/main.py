@@ -13,14 +13,47 @@ import sys
 from . import paths
 from .config import load_config
 from .input_source import choose_sample, list_samples, record_video
-from . import step1_blur_filter, step2_masking, step3_reconstruct, step4_mesh_export, step5_mesh_refine
+STEP_TITLES = {
+    1: "Loc frame mo",
+    2: "Tach phong (Grounded-SAM 2)",
+    3: "COLMAP + 3DGS",
+    4: "Dung mesh khoi tao (Poisson)",
+    5: "Tinh chinh & lam min mesh",
+}
+
+
+def _run_step(step_idx: int, name: str, cfg: dict):
+    """Lazy import tung buoc khi thuc su chay, tranh crash khi thieu thu vien o buoc khac."""
+    try:
+        if step_idx == 1:
+            from . import step1_blur_filter
+            return step1_blur_filter.run(name, cfg)
+        elif step_idx == 2:
+            from . import step2_masking
+            return step2_masking.run(name, cfg)
+        elif step_idx == 3:
+            from . import step3_reconstruct
+            return step3_reconstruct.run(name, cfg)
+        elif step_idx == 4:
+            from . import step4_mesh_export
+            return step4_mesh_export.run(name, cfg)
+        elif step_idx == 5:
+            from . import step5_mesh_refine
+            return step5_mesh_refine.run(name, cfg)
+    except ImportError as exc:
+        print(f"\n[Loi] Khong the chay Buoc {step_idx} ({STEP_TITLES.get(step_idx)}) do thieu thu vien:")
+        print(f"  -> {exc}")
+        print(f"  Goi y: Hay kiem tra moi truong hoac cai dat thu vien phu hop cho rieng buoc nay.\n")
+        return None
+    raise ValueError(f"Khong ton tai buoc {step_idx}")
+
 
 STEPS = {
-    1: ("Loc frame mo",                  step1_blur_filter.run),
-    2: ("Tach phong (Grounded-SAM 2)",   step2_masking.run),
-    3: ("COLMAP + 3DGS",                 step3_reconstruct.run),
-    4: ("Dung mesh khoi tao (Poisson)",  step4_mesh_export.run),
-    5: ("Tinh chinh & lam min mesh",     step5_mesh_refine.run),
+    1: (STEP_TITLES[1], lambda name, cfg: _run_step(1, name, cfg)),
+    2: (STEP_TITLES[2], lambda name, cfg: _run_step(2, name, cfg)),
+    3: (STEP_TITLES[3], lambda name, cfg: _run_step(3, name, cfg)),
+    4: (STEP_TITLES[4], lambda name, cfg: _run_step(4, name, cfg)),
+    5: (STEP_TITLES[5], lambda name, cfg: _run_step(5, name, cfg)),
 }
 
 # Buoc nao can biet nguon video / camera
@@ -151,6 +184,8 @@ def main() -> None:
                     help="bat dau tu buoc nay (mac dinh: 1)")
     ap.add_argument("--until",   type=int, default=None, choices=list(STEPS),
                     help="chay den buoc nay (mac dinh: bang --start)")
+    ap.add_argument("--only-record", action="store_true",
+                    help="chi quay / chon mau video roi dung, khong chay cac buoc xu ly tiep theo")
     args = ap.parse_args()
 
     # --until mac dinh bang --start (khong truyen = chi chay 1 buoc)
@@ -177,6 +212,10 @@ def main() -> None:
     source, name = _resolve_sample(args, cfg, need_source)
     if not name:
         print("Khong co mau de xu ly. Thoat.")
+        return
+
+    if args.only_record:
+        print(f"\nDa luu mau: {name}. Hoan tat theo yeu cau (--only-record).")
         return
 
     # Lay va luu prompt nhan dien vat the (buoc 2)
