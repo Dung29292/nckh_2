@@ -64,7 +64,7 @@ mesh_export:         # Buoc 4
   bpa_r2_mult: 2.5              # he so ban kinh lan cap 2
   bpa_r3_mult: 5.0              # he so ban kinh lan cap 3
   poisson_depth: 8              # do sau Octree 8: can bang hoan hao giua do min va chi tiet quai xach
-  poisson_density_quantile: 0.0     # 0.0: cam tuyet doi cat theo quantile vi se duc thung lo tren nap va vach
+  poisson_density_quantile: 0.015   # 1.5%: cat gon gang bong bong ngoai vi de lo chu trinh bien sach se
   poisson_linear_fit: true
   stat_nb: 20
   stat_ratio: 1.5

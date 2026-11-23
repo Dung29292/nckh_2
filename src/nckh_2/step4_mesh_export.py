@@ -57,9 +57,29 @@ def _load_gaussian_ply(path: Path) -> o3d.geometry.PointCloud:
 
     if "opacity" in names:
         opacity = 1.0 / (1.0 + np.exp(-v["opacity"].astype(np.float64)))
-        keep = np.nonzero(opacity > 0.2)[0]
+        solid_mask = opacity > 0.5
+        if all(f"scale_{i}" in names for i in range(3)):
+            s0 = np.exp(v["scale_0"].astype(np.float64))
+            s1 = np.exp(v["scale_1"].astype(np.float64))
+            s2 = np.exp(v["scale_2"].astype(np.float64))
+            max_scale = np.maximum(s0, np.maximum(s1, s2))
+            # Loai bo cac floaters khong khi co ban kinh lon hoac do trong suot cao
+            scale_thresh = float(np.percentile(max_scale, 85))
+            solid_mask = solid_mask & (max_scale < scale_thresh)
+        keep = np.nonzero(solid_mask)[0]
         pc = pc.select_by_index(keep)
-        print(f"  loc opacity > 0.2: giu {len(keep):,}/{len(xyz):,} diem")
+        print(f"  loc floaters khong khi (opacity > 0.5 & compact scale): giu {len(keep):,}/{len(xyz):,} diem")
+
+        # DBSCAN chon cum thuc the dac duy nhat cua vat the
+        if len(pc.points) > 100:
+            labels = np.array(pc.cluster_dbscan(eps=0.08, min_points=30, print_progress=False))
+            valid = labels >= 0
+            if np.any(valid):
+                counts = np.bincount(labels[valid])
+                largest_c = int(np.argmax(counts))
+                keep_c = np.nonzero(labels == largest_c)[0]
+                pc = pc.select_by_index(keep_c)
+                print(f"  DBSCAN co lap vat the chinh: giu {len(keep_c):,} diem dac")
 
     return pc
 
@@ -489,33 +509,18 @@ def _obb_mesh(pc: o3d.geometry.PointCloud) -> o3d.geometry.TriangleMesh:
 # ---------------------------------------------------------------------------
 
 def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-    """Dong kin open mesh thanh watertight bang cach bit kin cac chu trinh bien (boundary loops)."""
+    """Dong kin open mesh thanh watertight tong quat cho moi vat the (Reverse Engineering Planar Base Extrusion).
+
+    Vat the chup tren ban luon bi che mat day (2.5D surface).
+    Thuat toan tong quat:
+      1. Tim cac chu trinh bien ho (boundary loops) theo directed edges.
+      2. Chu trinh bien chinh lon nhat (o day vat the) duoc keo tuong thang dung xuong mat san Z=0 va bit kin day.
+      3. Cac chu trinh bien nho (lo noi tai tren be mat) duoc fan-fill cuc bo.
+      4. Khau kin topology va lam muot chuyen tiep tranh rang cua hay chem ngang cheo.
+    """
     if mesh.is_watertight():
         print("  mesh da watertight")
         return mesh
-
-    # 1. Thu bit kin bang PyMeshLab (chuyen nghiep, xu ly da bien da tap)
-    try:
-        import pymeshlab
-        ms = pymeshlab.MeshSet()
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        tris = np.asarray(mesh.triangles, dtype=np.int32)
-        pm = pymeshlab.Mesh(vertex_matrix=verts, face_matrix=tris)
-        ms.add_mesh(pm)
-        ms.meshing_repair_non_manifold_edges()
-        ms.meshing_repair_non_manifold_vertices()
-        ms.meshing_close_holes(maxholesize=10000)
-        res = ms.current_mesh()
-        result = o3d.geometry.TriangleMesh()
-        result.vertices = o3d.utility.Vector3dVector(res.vertex_matrix())
-        result.triangles = o3d.utility.Vector3iVector(res.face_matrix())
-        result.remove_degenerate_triangles()
-        result.remove_duplicated_vertices()
-        result.compute_vertex_normals()
-        print(f"  PyMeshLab close holes: {len(result.vertices):,} dinh, {len(result.triangles):,} tam giac, watertight={result.is_watertight()}")
-        return result
-    except Exception as e_pml:
-        print(f"  PyMeshLab close holes khong kha dung ({e_pml}), dung boundary loop fan-fill...")
 
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
@@ -526,6 +531,7 @@ def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMe
     if len(tris) == 0:
         return mesh
 
+    # Xac dinh directed boundary edges
     directed: dict[tuple[int, int], int] = {}
     for tri in tris:
         a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
@@ -536,36 +542,75 @@ def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMe
     if not next_map:
         return mesh
 
-    remaining = dict(next_map)
+    visited_starts: set[int] = set()
     loops: list[list[int]] = []
-    while remaining:
-        start = next(iter(remaining))
-        cur = remaining.pop(start)
+    for start in list(next_map.keys()):
+        if start in visited_starts:
+            continue
         loop = [start]
-        while cur != start:
+        visited_starts.add(start)
+        cur = next_map.get(start, start)
+        while cur != start and cur not in visited_starts:
             loop.append(cur)
-            if cur not in remaining:
-                break
-            cur = remaining.pop(cur)
-        if cur == start and len(loop) >= 3:
+            visited_starts.add(cur)
+            cur = next_map.get(cur, start)
+        if len(loop) >= 3:
             loops.append(loop)
 
     if not loops:
         return mesh
 
-    print(f"  dong kin {len(loops)} chu trinh bien: {[len(l) for l in loops]} dinh")
-    new_v = [verts]
-    new_t = [tris]
+    loops.sort(key=len, reverse=True)
+    print(f"  Phat hien {len(loops)} chu trinh bien: {[len(l) for l in loops[:5]]} dinh")
+
+    z_floor = 0.0
+    new_v: list[np.ndarray] = [verts]
+    new_t: list[np.ndarray] = [tris]
     offset = len(verts)
 
-    for loop in loops:
+    for l_idx, loop in enumerate(loops):
         k = len(loop)
-        cent = verts[loop].mean(axis=0)
-        c_idx = offset
-        new_v.append(cent[None])
-        offset += 1
-        fill_tris = [[c_idx, loop[(i + 1) % k], loop[i]] for i in range(k)]
-        new_t.append(np.array(fill_tris, dtype=np.int32))
+        loop_xyz = verts[loop]
+
+        # Loop lon nhat hoac loop co do cao thap tiep giap san -> Tao tuong xuong san Z=0 va bit day
+        if l_idx == 0 and len(loop) >= 8:
+            cap_xyz = loop_xyz.copy()
+            cap_xyz[:, 2] = z_floor
+            cap_start = offset
+            new_v.append(cap_xyz)
+            offset += k
+
+            cent_floor = cap_xyz.mean(axis=0)
+            c_idx = offset
+            new_v.append(cent_floor[None])
+            offset += 1
+
+            # Tuong ben (side walls)
+            side_tris = []
+            for i in range(k):
+                a = loop[i]
+                b = loop[(i + 1) % k]
+                ca = cap_start + i
+                cb = cap_start + (i + 1) % k
+                side_tris.append([a, cb, b])
+                side_tris.append([a, ca, cb])
+            new_t.append(np.array(side_tris, dtype=np.int32))
+
+            # Mat day (floor fan)
+            xy = cap_xyz[:, :2]
+            c_xy = cent_floor[:2]
+            ang = np.arctan2(xy[:, 1] - c_xy[1], xy[:, 0] - c_xy[0])
+            ord_idx = np.argsort(ang)
+            floor_tris = [[c_idx, cap_start + ord_idx[i], cap_start + ord_idx[(i + 1) % k]] for i in range(k)]
+            new_t.append(np.array(floor_tris, dtype=np.int32))
+        else:
+            # Cac lo thung nho cuc bo tren be mat -> Fan-fill cuc bo
+            cent = loop_xyz.mean(axis=0)
+            c_idx = offset
+            new_v.append(cent[None])
+            offset += 1
+            fill_tris = [[c_idx, loop[(i + 1) % k], loop[i]] for i in range(k)]
+            new_t.append(np.array(fill_tris, dtype=np.int32))
 
     result = o3d.geometry.TriangleMesh()
     result.vertices = o3d.utility.Vector3dVector(np.vstack(new_v))
@@ -573,6 +618,7 @@ def _make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMe
     result.remove_degenerate_triangles()
     result.remove_duplicated_vertices()
     result.compute_vertex_normals()
+    print(f"  Dong kin mesh hoan tat: {len(result.vertices):,} dinh, {len(result.triangles):,} tam giac, watertight={result.is_watertight()}")
     return result
 
 
