@@ -328,13 +328,52 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     .guide-overlay.hidden { opacity: 0; }
     .guide-box {
       position: relative;
-      width: min(74vw, 55vh);
-      height: min(74vw, 55vh);
+      width: min(76vw, 56vh);
+      height: min(76vw, 56vh);
       border: 1px dashed rgba(255, 255, 255, 0.35);
       border-radius: 20px;
       display: flex;
       align-items: center;
       justify-content: center;
+    }
+    .orbit-ring {
+      position: absolute;
+      width: 82%;
+      height: 82%;
+      border: 1.5px dashed rgba(96, 165, 250, 0.5);
+      border-radius: 50%;
+      pointer-events: none;
+    }
+    .level-indicator {
+      position: absolute;
+      top: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      font-size: 11px;
+      font-weight: 700;
+      color: #94a3b8;
+      backdrop-filter: blur(6px);
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .level-indicator.aligned {
+      border-color: #10b981;
+      color: #6ee7b7;
+      background: rgba(6, 78, 59, 0.6);
+    }
+    .level-line {
+      width: 22px;
+      height: 2px;
+      background: #94a3b8;
+      transform-origin: center;
+      transition: transform 0.08s ease-out, background 0.15s;
+    }
+    .level-indicator.aligned .level-line {
+      background: #10b981;
     }
     .corner {
       position: absolute;
@@ -348,25 +387,25 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     .corner.bl { bottom: -2px; left: -2px; border-width: 0 0 3px 3px; border-bottom-left-radius: 20px; }
     .corner.br { bottom: -2px; right: -2px; border-width: 0 3px 3px 0; border-bottom-right-radius: 20px; }
     .crosshair {
-      width: 20px;
-      height: 20px;
+      width: 22px;
+      height: 22px;
       position: relative;
     }
     .crosshair::before, .crosshair::after {
       content: "";
       position: absolute;
-      background: rgba(255, 255, 255, 0.55);
+      background: rgba(255, 255, 255, 0.65);
     }
-    .crosshair::before { top: 9px; left: 0; right: 0; height: 2px; }
-    .crosshair::after { left: 9px; top: 0; bottom: 0; width: 2px; }
+    .crosshair::before { top: 10px; left: 0; right: 0; height: 2px; }
+    .crosshair::after { left: 10px; top: 0; bottom: 0; width: 2px; }
     .guide-label {
       position: absolute;
       bottom: 10px;
       font-size: 11px;
       font-weight: 600;
       letter-spacing: 0.5px;
-      color: rgba(255, 255, 255, 0.75);
-      background: rgba(15, 23, 42, 0.65);
+      color: rgba(255, 255, 255, 0.85);
+      background: rgba(15, 23, 42, 0.7);
       backdrop-filter: blur(6px);
       padding: 3px 10px;
       border-radius: 999px;
@@ -405,6 +444,57 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     .rec-pill.active { display: inline-flex; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
     .stats { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+
+    /* Pro Timer & Comparison Banner */
+    .pro-timer-banner {
+      position: absolute;
+      top: calc(env(safe-area-inset-top, 12px) + 54px);
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1.5px solid var(--border);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+      z-index: 15;
+      font-variant-numeric: tabular-nums;
+    }
+    .pro-timer-banner.recording {
+      display: inline-flex;
+      border-color: var(--danger);
+      background: rgba(30, 10, 10, 0.92);
+    }
+    .pro-timer-banner.recorded-done {
+      display: inline-flex;
+      border-color: #3b82f6;
+      background: rgba(15, 23, 42, 0.92);
+    }
+    .timer-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--danger);
+      animation: pulse 1s infinite;
+    }
+    .pro-timer-banner.recorded-done .timer-dot {
+      background: #10b981;
+      animation: none;
+    }
+    .timer-digits {
+      font-size: 16px;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: 0.5px;
+    }
+    .timer-frames {
+      font-size: 12px;
+      font-weight: 600;
+      color: #94a3b8;
+    }
 
     /* Zoom Pill */
     .zoom-pill {
@@ -549,7 +639,12 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
         <div class="corner bl"></div>
         <div class="corner br"></div>
         <div class="crosshair"></div>
-        <span class="guide-label">GIỮ VẬT THỂ TRONG KHUNG 3D</span>
+        <div class="orbit-ring"></div>
+        <div id="levelBar" class="level-indicator">
+          <div id="levelLine" class="level-line"></div>
+          <span id="levelText">0°</span>
+        </div>
+        <span class="guide-label">GIỮ VẬT THỂ Ở TÂM & XOAY 360° ĐỀU TAY</span>
       </div>
     </div>
 
@@ -559,8 +654,15 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
         <span id="statusDot" class="dot"></span>
         <span id="statusText">Đang kết nối...</span>
       </div>
-      <div id="recBadge" class="rec-pill">● REC</div>
+      <div id="recBadge" class="rec-pill">● REC <span id="recTimer" style="margin-left:4px">00:00</span></div>
       <div id="statsText" class="stats">0 fps | 0 KB</div>
+    </div>
+
+    <!-- Dedicated Big Stopwatch Overlay -->
+    <div id="proTimerBanner" class="pro-timer-banner">
+      <div class="timer-dot"></div>
+      <span id="bigTimerText" class="timer-digits">00:00.0</span>
+      <span id="bigFrameText" class="timer-frames">(0 f)</span>
     </div>
 
     <!-- Hardware Zoom Pill -->
@@ -572,10 +674,11 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     <!-- Bottom HUD -->
     <div class="hud-bottom">
       <div class="settings-row">
-        <select id="resSelect" title="Độ phân giải">
-          <option value="1280x720" selected>720p (Nhanh / Ổn định)</option>
-          <option value="1920x1080">1080p (Chi tiết cao)</option>
-          <option value="960x540">540p (Wi-Fi yếu)</option>
+        <select id="resSelect" title="Độ phân giải & Tốc độ">
+          <option value="1280x720@60" selected>720p (Khuyên dùng: Siêu mượt 30-60 FPS)</option>
+          <option value="960x540@60">540p (Siêu tốc độ 60 FPS)</option>
+          <option value="1280x720@30">720p @ 30 FPS (Chuẩn ổn định)</option>
+          <option value="1920x1080@30">1080p (Rất nặng - Cần máy mạnh)</option>
         </select>
         <select id="cameraSelect" title="Chọn ống kính">
           <option value="">Mặc định: Camera sau</option>
@@ -610,12 +713,16 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     const statusText = document.getElementById("statusText");
     const statsText = document.getElementById("statsText");
     const recBadge = document.getElementById("recBadge");
+    const recTimer = document.getElementById("recTimer");
     const resSelect = document.getElementById("resSelect");
     const cameraSelect = document.getElementById("cameraSelect");
     const switchBtn = document.getElementById("switchBtn");
     const torchBtn = document.getElementById("torchBtn");
     const guideBtn = document.getElementById("guideBtn");
     const guideOverlay = document.getElementById("guideOverlay");
+    const levelBar = document.getElementById("levelBar");
+    const levelLine = document.getElementById("levelLine");
+    const levelText = document.getElementById("levelText");
     const recBtn = document.getElementById("recBtn");
     const recBtnText = document.getElementById("recBtnText");
     const zoom1xBtn = document.getElementById("zoom1xBtn");
@@ -624,9 +731,14 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     const errTitle = document.getElementById("errTitle");
     const errMsg = document.getElementById("errMsg");
     const retryBtn = document.getElementById("retryBtn");
+    const proTimerBanner = document.getElementById("proTimerBanner");
+    const bigTimerText = document.getElementById("bigTimerText");
+    const bigFrameText = document.getElementById("bigFrameText");
 
+    // Bo dem don tinh gon & toc do cao (Zero-Overhead Single Buffer)
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d", { alpha: false });
+    let inFlightBlob = false;
 
     let stream = null;
     let ws = null;
@@ -635,7 +747,6 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     let torchOn = false;
     let torchSupported = false;
     let streaming = true;
-    let inFlightBlob = false;
     let wakeLock = null;
 
     let zoomCaps = null;
@@ -643,11 +754,18 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     let touchStartDist = 0;
     let baseZoom = 1.0;
 
-    const TARGET_FPS = 30;
-    const JPEG_QUALITY = 0.84;
+    let TARGET_FPS = 60;
+    let TARGET_W = 1280;
+    let TARGET_H = 720;
+    const JPEG_QUALITY = 0.65;
     let lastSentMs = 0;
     let frameCounter = 0;
     let lastKb = 0;
+
+    let isRecording = false;
+    let recStartTime = 0;
+    let recTimerInterval = null;
+    let recordedFrameCount = 0;
 
     function setStatus(state, text) {
       statusDot.className = "dot " + (state === "ok" ? "ok" : state === "err" ? "err" : "");
@@ -730,10 +848,20 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       }
 
       stopCamera();
-      const [reqW, reqH] = resSelect.value.split("x").map(Number);
+      const [resPart, fpsPart] = resSelect.value.split("@");
+      const [reqW, reqH] = resPart.split("x").map(Number);
+      TARGET_FPS = fpsPart ? Number(fpsPart) : 60;
+      TARGET_W = reqW;
+      TARGET_H = reqH;
+
+      // Tu dong dao chieu rong / cao theo dung huong xoay (Portrait / Landscape)
+      const isPortrait = window.innerHeight > window.innerWidth;
+      const idealW = isPortrait ? Math.min(reqW, reqH) : Math.max(reqW, reqH);
+      const idealH = isPortrait ? Math.max(reqW, reqH) : Math.min(reqW, reqH);
+
       const videoConstraint = selectedDeviceId
-        ? { deviceId: { exact: selectedDeviceId }, width: { ideal: reqW }, height: { ideal: reqH }, frameRate: { ideal: TARGET_FPS } }
-        : { facingMode: { ideal: facingMode }, width: { ideal: reqW }, height: { ideal: reqH }, frameRate: { ideal: TARGET_FPS } };
+        ? { deviceId: { exact: selectedDeviceId }, width: { ideal: idealW }, height: { ideal: idealH }, frameRate: { ideal: TARGET_FPS, min: 30 } }
+        : { facingMode: { ideal: facingMode }, width: { ideal: idealW }, height: { ideal: idealH }, frameRate: { ideal: TARGET_FPS, min: 30 } };
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraint });
@@ -763,6 +891,22 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    function playBeep(freq = 880, duration = 0.12) {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+      } catch (_) {}
+    }
+
     function connectWebSocket() {
       const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${wsProto}//${window.location.host}/ws?token=${encodeURIComponent(TOKEN)}`;
@@ -779,9 +923,56 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
           try {
             const msg = JSON.parse(ev.data);
             if (msg.type === "status" && typeof msg.recording === "boolean") {
-              recBadge.classList.toggle("active", msg.recording);
-              recBtn.classList.toggle("recording", msg.recording);
-              recBtnText.textContent = msg.recording ? "Dừng" : "Quay";
+              const wasRecording = isRecording;
+              isRecording = msg.recording;
+              recBadge.classList.toggle("active", isRecording);
+              recBtn.classList.toggle("recording", isRecording);
+              recBtnText.textContent = isRecording ? "Dừng" : "Quay";
+
+              if (isRecording) {
+                recStartTime = Date.now();
+                recordedFrameCount = 0;
+                playBeep(880, 0.15);
+                if ("vibrate" in navigator) navigator.vibrate([50, 40, 50]);
+                if (proTimerBanner) {
+                  proTimerBanner.className = "pro-timer-banner recording";
+                }
+                if (recTimerInterval) clearInterval(recTimerInterval);
+                recTimerInterval = setInterval(() => {
+                  if (!isRecording) return;
+                  const elapsedMs = Date.now() - recStartTime;
+                  const totalSec = Math.floor(elapsedMs / 1000);
+                  const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
+                  const ss = String(totalSec % 60).padStart(2, "0");
+                  const timeStr = `${mm}:${ss}`;
+
+                  if (recTimer) recTimer.textContent = `${mm}:${ss} | ${recordedFrameCount}f`;
+                  if (bigTimerText) bigTimerText.textContent = timeStr;
+                  if (bigFrameText) {
+                    const fpsEst = elapsedMs > 500 ? (recordedFrameCount / (elapsedMs / 1000)).toFixed(1) : "0.0";
+                    bigFrameText.textContent = `🔴 Đang ghi: ${recordedFrameCount} f (${fpsEst} fps)`;
+                  }
+                }, 250);
+              } else {
+                if (recTimerInterval) clearInterval(recTimerInterval);
+                recTimerInterval = null;
+                if (wasRecording) {
+                  playBeep(587, 0.1);
+                  setTimeout(() => playBeep(880, 0.18), 120);
+                  if ("vibrate" in navigator) navigator.vibrate([100]);
+                }
+                if (proTimerBanner && recordedFrameCount > 0) {
+                  proTimerBanner.className = "pro-timer-banner recorded-done";
+                  const elapsedSec = ((Date.now() - recStartTime) / 1000).toFixed(1);
+                  if (bigTimerText) bigTimerText.textContent = `Đã quay: ${elapsedSec}s`;
+                  if (bigFrameText) bigFrameText.textContent = `✅ ${recordedFrameCount} frames -> Đã lưu trên PC`;
+                } else if (proTimerBanner) {
+                  proTimerBanner.className = "pro-timer-banner";
+                  if (bigTimerText) bigTimerText.textContent = "00:00.0";
+                  if (bigFrameText) bigFrameText.textContent = "Chờ quay (Bấm [R] trên PC hoặc [Quay])";
+                }
+                if (recTimer) recTimer.textContent = "00:00";
+              }
             }
           } catch (_) {}
         }
@@ -804,9 +995,10 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     function sendLoop(now) {
       requestAnimationFrame(sendLoop);
       if (!streaming || !ws || ws.readyState !== WebSocket.OPEN) return;
-      if (inFlightBlob || ws.bufferedAmount > 65536) return;
+      if (inFlightBlob || ws.bufferedAmount > 524288) return;
       if (videoEl.readyState < 2 || !videoEl.videoWidth || !videoEl.videoHeight) return;
-      if (now - lastSentMs < 1000 / TARGET_FPS) return;
+      const frameInterval = 1000 / TARGET_FPS;
+      if (now - lastSentMs < frameInterval - 4) return;
 
       lastSentMs = now;
       if (canvas.width !== videoEl.videoWidth || canvas.height !== videoEl.videoHeight) {
@@ -815,12 +1007,14 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
       }
       ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
       inFlightBlob = true;
+
       canvas.toBlob(
         (blob) => {
           inFlightBlob = false;
-          if (blob && ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= 131072) {
+          if (blob && ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= 1048576) {
             ws.send(blob);
             frameCounter++;
+            if (isRecording) recordedFrameCount++;
             lastKb = Math.round(blob.size / 1024);
           }
         },
@@ -832,7 +1026,14 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     setInterval(() => {
       const vw = videoEl.videoWidth || 0;
       const vh = videoEl.videoHeight || 0;
-      statsText.textContent = `${vw}x${vh} | ${frameCounter} fps | ${lastKb} KB`;
+      let camFps = TARGET_FPS;
+      if (stream) {
+        const track = stream.getVideoTracks()[0];
+        if (track && track.getSettings && track.getSettings().frameRate) {
+          camFps = Math.round(track.getSettings().frameRate);
+        }
+      }
+      statsText.textContent = `${vw}x${vh} | Cam: ${camFps}f | Net: ${frameCounter} fps | ${lastKb} KB`;
       frameCounter = 0;
     }, 1000);
 
@@ -905,7 +1106,7 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
     });
 
     recBtn.addEventListener("click", () => {
-      if ("vibrate" in navigator) navigator.vibrate(50);
+      if ("vibrate" in navigator) navigator.vibrate([40, 60, 40]);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "control", action: "toggle_record" }));
       }
@@ -1008,6 +1209,7 @@ class MobileVideoCapture:
         self._ws_lock = threading.Lock()
         self._active_ws: simple_websocket.Server | None = None
         self._recording_state = False
+        self._record_queue: collections.deque[np.ndarray] = collections.deque(maxlen=1200)
         self._cmd_queue: collections.deque[str] = collections.deque()
 
         self._qr_img_cache: np.ndarray | None = None
@@ -1030,7 +1232,11 @@ class MobileVideoCapture:
         def index():
             if not capture_ref._check_token(request.args.get("token")):
                 abort(403, description="Phien truy cap khong hop le hoac da het han (Sai token).")
-            return Response(_MOBILE_HTML, mimetype="text/html; charset=utf-8")
+            resp = Response(_MOBILE_HTML, mimetype="text/html; charset=utf-8")
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+            return resp
 
         @app.get("/health")
         def health():
@@ -1095,6 +1301,8 @@ class MobileVideoCapture:
                         self._latest_frame = frame
                         self._frame_seq += 1
                         self._frame_timestamps.append(now)
+                        if self._recording_state:
+                            self._record_queue.append(frame)
                         self._frame_cond.notify_all()
                 elif isinstance(msg, str):
                     try:
@@ -1218,8 +1426,25 @@ class MobileVideoCapture:
         with self._frame_cond:
             return self._latest_frame is not None
 
+    def get_live_preview(self) -> np.ndarray | None:
+        """Tra ve frame thoi gian thuc moi nhat (Zero Latency) ma khong block."""
+        with self._frame_cond:
+            return self._latest_frame
+
+    def pop_recorded_frames(self) -> list[np.ndarray]:
+        """Lay toan bo frame da duoc ghi nhan trong hang doi khi dang quay."""
+        with self._frame_cond:
+            if not self._record_queue:
+                return []
+            frames = list(self._record_queue)
+            self._record_queue.clear()
+            return frames
+
     def set_recording_state(self, recording: bool) -> None:
         self._recording_state = bool(recording)
+        if self._recording_state:
+            with self._frame_cond:
+                self._record_queue.clear()
         with self._ws_lock:
             ws = self._active_ws
             if ws is not None and ws.connected:

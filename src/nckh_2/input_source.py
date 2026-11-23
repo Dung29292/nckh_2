@@ -1,5 +1,8 @@
 """Nguon dau vao: (1) quay video truc tiep -> luu thanh mau moi, hoac (2) chon mau co san."""
+import collections
 import json
+import queue
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +40,110 @@ def choose_sample(video_file: str) -> str | None:
         print("Lua chon khong hop le.")
 
 
+class LiveCameraReader:
+    """Doc camera USB tren mot background thread rieng biet.
+    Triet tieu 100% do tre tich luy trong DirectShow driver buffer tren Windows
+    va cung cap hang doi ghi khong mat frame khi quay."""
+    def __init__(self, raw_cap):
+        self.raw_cap = raw_cap
+        self._latest_frame: np.ndarray | None = None
+        self._record_queue: collections.deque[np.ndarray] = collections.deque(maxlen=1200)
+        self._recording = False
+        self._running = True
+        self._lock = threading.Lock()
+        # Doc truoc frame dau tien de co san latest_frame ngay lap tuc
+        try:
+            ok, frame = self.raw_cap.read()
+            if ok and frame is not None:
+                self._latest_frame = frame
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while self._running and self.raw_cap.isOpened():
+            ok, frame = self.raw_cap.read()
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._latest_frame = frame
+                if self._recording:
+                    self._record_queue.append(frame)
+
+    def get_live_preview(self) -> np.ndarray | None:
+        """Lay frame moi nhat tuc thoi (Zero Latency) de hien thi tren Desktop."""
+        with self._lock:
+            return self._latest_frame
+
+    def pop_recorded_frames(self) -> list[np.ndarray]:
+        """Rut toan bo frame da thu nhap vao hang doi de ghi vao file video."""
+        with self._lock:
+            if not self._record_queue:
+                return []
+            frames = list(self._record_queue)
+            self._record_queue.clear()
+            return frames
+
+    def set_recording_state(self, recording: bool) -> None:
+        with self._lock:
+            self._recording = bool(recording)
+            if self._recording:
+                self._record_queue.clear()
+
+    def isOpened(self) -> bool:
+        return self._running and self.raw_cap.isOpened()
+
+    def get(self, prop_id: int) -> float:
+        return float(self.raw_cap.get(prop_id))
+
+    def set(self, prop_id: int, value: float) -> bool:
+        return bool(self.raw_cap.set(prop_id, value))
+
+    def release(self) -> None:
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self.raw_cap.release()
+
+
+class AsyncVideoWriter:
+    """Ghi video bat dong bo ra o dia bang Worker Thread rieng biet.
+    Khong bao gio lam cham giao dien Desktop va khong bao gio drop frame."""
+    def __init__(self, filepath: str, fourcc: int, fps: float, size: tuple[int, int]):
+        self.writer = cv2.VideoWriter(filepath, fourcc, fps, size)
+        self.queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1500)
+        self.stopped = False
+        self.written_frames = 0
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def write(self, frame: np.ndarray) -> None:
+        if not self.stopped:
+            try:
+                self.queue.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def _worker(self) -> None:
+        while not self.stopped or not self.queue.empty():
+            try:
+                frame = self.queue.get(timeout=0.05)
+                self.writer.write(frame)
+                self.written_frames += 1
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+
+    def release(self) -> int:
+        self.stopped = True
+        if self.thread.is_alive():
+            self.thread.join(timeout=8.0)
+        self.writer.release()
+        return self.written_frames
+
+
 # ---------------------------------------------------------------- quay video
 def _is_mobile_source(camera) -> bool:
     return isinstance(camera, str) and camera.strip().lower() in ("mobile", "phone", "qr")
@@ -67,20 +174,22 @@ def _open_camera(camera, width: int, height: int, fps: int, rec_cfg: dict | None
     if isinstance(camera, str) and camera.isdigit():
         camera = int(camera)
     # CAP_DSHOW on dinh nhat tren Windows
-    cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW) if isinstance(camera, int) else cv2.VideoCapture(camera)
-    if not cap.isOpened() and isinstance(camera, int):
-        cap = cv2.VideoCapture(camera)
+    raw_cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW) if isinstance(camera, int) else cv2.VideoCapture(camera)
+    if not raw_cap.isOpened() and isinstance(camera, int):
+        raw_cap = cv2.VideoCapture(camera)
 
     # TRIET TIEU DO TRE (ZERO LATENCY):
     # 1. Ep FourCC MJPG truoc de camera USB truyen nen phan cung (dat 30-60 FPS)
     if isinstance(camera, int):
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        # 2. Buffer size = 1: Chi giu frame moi nhat, tranh ton dong hang doi gay lag
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+        raw_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        raw_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        raw_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        raw_cap.set(cv2.CAP_PROP_FPS, fps)
+        raw_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not raw_cap.isOpened():
+        return raw_cap
+    return LiveCameraReader(raw_cap)
 
 
 def _read_cam_props(cap, default_fps: float) -> tuple[int, int, float]:
@@ -178,6 +287,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
     win_name = "nckh_2 - record"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1040, 660)
+
+    win_w, win_h = 1040, 660
+    canvas = np.full((win_h, win_w, 3), (16, 20, 28), dtype=np.uint8)
+    loop_idx = 0
 
     show_grid = True
     clicked_action: str | None = None
@@ -281,58 +394,60 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
+        loop_idx += 1
         is_mobile = _is_mobile_cap(cap)
-        new_frame_arrived = False
         if is_mobile:
             if cap.pop_command() == "toggle_record":
                 key_trigger_record = True
             else:
                 key_trigger_record = False
-            ok, frame = cap.read(timeout=0.04)
-            if not ok:
-                if not cap.has_frame or last_mobile_frame is None:
-                    raw_display = cap.get_qr_card()
-                    frame_ready = False
-                else:
-                    frame = last_mobile_frame
-                    raw_display = frame
-                    frame_ready = True
-            else:
-                last_mobile_frame = frame
-                raw_display = frame
-                frame_ready = True
-                new_frame_arrived = True
-                # Dong bo kich thuoc thuc te khi dien thoai xoay ngang/doc luc chua quay
-                fh, fw = frame.shape[:2]
-                if writer is None and (fw != w or fh != h):
-                    w, h = fw, fh
         else:
             key_trigger_record = False
-            ok, frame = cap.read()
-            if not ok:
-                print("Mat tin hieu camera.")
-                break
+
+        # 1. Ghi cac frame moi nhat vao VideoWriter ngam (Lossless Frame Queue)
+        if writer is not None:
+            new_frames = cap.pop_recorded_frames()
+            for nf in new_frames:
+                write_frame = nf
+                if nf.shape[1] != w or nf.shape[0] != h:
+                    write_frame = cv2.resize(nf, (w, h))
+                writer.write(write_frame)
+                recorded_frames += 1
+
+        # 2. Lay frame moi nhat tuc thoi (Zero Latency) de hien thi tren Desktop
+        live_frame = cap.get_live_preview()
+        if live_frame is None:
+            if is_mobile and not cap.has_frame:
+                raw_display = cap.get_qr_card()
+                frame_ready = False
+            elif last_mobile_frame is not None:
+                frame = last_mobile_frame
+                raw_display = frame
+                frame_ready = True
+            else:
+                time.sleep(0.005)
+                continue
+        else:
+            frame = live_frame
+            last_mobile_frame = frame
             raw_display = frame
             frame_ready = True
-            new_frame_arrived = True
-
-        if frame_ready and writer is not None and new_frame_arrived:
-            write_frame = frame
-            if frame.shape[1] != w or frame.shape[0] != h:
-                write_frame = cv2.resize(frame, (w, h))
-            writer.write(write_frame)
-            recorded_frames += 1
+            fh, fw = frame.shape[:2]
+            if writer is None and (fw != w or fh != h):
+                w, h = fw, fh
 
         # --- LETTERBOXING & PRO HUD RENDERING ---
-        win_w, win_h = 1040, 660
-        try:
-            r = cv2.getWindowImageRect(win_name)
-            if r[2] >= 480 and r[3] >= 320:
-                win_w, win_h = r[2], r[3]
-        except Exception:
-            pass
+        if loop_idx % 20 == 0:
+            try:
+                r = cv2.getWindowImageRect(win_name)
+                if r[2] >= 480 and r[3] >= 320:
+                    if r[2] != win_w or r[3] != win_h:
+                        win_w, win_h = r[2], r[3]
+                        canvas = np.full((win_h, win_w, 3), (16, 20, 28), dtype=np.uint8)
+            except Exception:
+                pass
 
-        canvas = np.full((win_h, win_w, 3), (16, 20, 28), dtype=np.uint8)
+        canvas[:] = (16, 20, 28)
 
         # Tinh toan Letterboxing giu nguyen ti le goc
         top_bar_h = 42
@@ -340,7 +455,9 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         avail_w = win_w
         avail_h = max(100, win_h - top_bar_h - bot_bar_h)
 
-        disp_source = raw_display if (is_mobile and not cap.has_frame) else frame.copy()
+        disp_source = raw_display if (is_mobile and not cap.has_frame) else frame
+        if disp_source is None:
+            continue
         dh, dw = disp_source.shape[:2]
         scale = min(avail_w / max(dw, 1), avail_h / max(dh, 1))
         sc_w = max(1, int(dw * scale))
@@ -458,19 +575,24 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 print("Hay quet ma QR tren dien thoai va cho hinh anh hien thi truoc khi quay.")
             elif writer is None:
                 sdir.mkdir(parents=True, exist_ok=True)
-                writer = cv2.VideoWriter(str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                cap.set_recording_state(True)
+                writer = AsyncVideoWriter(str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                 t0 = time.time()
                 recorded_frames = 0
-                if is_mobile:
-                    cap.set_recording_state(True)
-                print("Bat dau quay...")
+                print(f"Bat dau quay ({w}x{h} @ {fps:.0f}fps)...")
             else:
-                writer.release()
+                cap.set_recording_state(False)
+                # Vet not toan bo frame con sot trong hang doi
+                final_frames = cap.pop_recorded_frames()
+                for nf in final_frames:
+                    write_frame = nf
+                    if nf.shape[1] != w or nf.shape[0] != h:
+                        write_frame = cv2.resize(nf, (w, h))
+                    writer.write(write_frame)
+                actual_written = writer.release()
                 writer, saved = None, True
-                if is_mobile:
-                    cap.set_recording_state(False)
                 actual_fps = _finalize_recorded_video(
-                    temp_video_path, video_path, recorded_frames, time.time() - t0, fps, (w, h)
+                    temp_video_path, video_path, actual_written, time.time() - t0, fps, (w, h)
                 )
                 break
 
@@ -516,11 +638,16 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             break
 
     if writer is not None:  # thoat khi dang quay -> van luu va dong bo FPS
-        writer.release()
-        if _is_mobile_cap(cap):
-            cap.set_recording_state(False)
+        cap.set_recording_state(False)
+        final_frames = cap.pop_recorded_frames()
+        for nf in final_frames:
+            write_frame = nf
+            if nf.shape[1] != w or nf.shape[0] != h:
+                write_frame = cv2.resize(nf, (w, h))
+            writer.write(write_frame)
+        actual_written = writer.release()
         actual_fps = _finalize_recorded_video(
-            temp_video_path, video_path, recorded_frames, time.time() - t0, fps, (w, h)
+            temp_video_path, video_path, actual_written, time.time() - t0, fps, (w, h)
         )
         saved = True
     if mobile_cap is not None:
