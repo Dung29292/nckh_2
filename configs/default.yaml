@@ -9,13 +9,20 @@ record:
   mobile_ssl: true              # bat HTTPS tu ky de trinh duyet dien thoai cho phep getUserMedia
   mobile_host_ip: ""            # de trong de tu dong chon IP Wi-Fi/Ethernet LAN
 
-blur_filter:         # Buoc 1
-  score_width: 640
-  window: 5
-  min_ratio: 0.6
-  max_frames: 60
-  save_max_side: 1920
-  jpg_quality: 95
+blur_filter:         # Buoc 1: Loc mo, khu rung giat va khu nhieu ISO
+  score_width: 480              # do rong frame de tinh nhanh do net & optical flow
+  window: 5                     # cua so xet cuc bo
+  min_ratio: 0.6                # nguong toi thieu theo trung vi do net
+  max_frames: 60                # so frame toi uu cho khoi tao va tai tao 3D
+  save_max_side: 1920           # chieu dai toi da khi xuat anh
+  jpg_quality: 95               # chat luong jpeg cao
+  enable_shake_filter: true     # khu rung: phat hien va phat diem frame co gia toc dot ngot (jerk)
+  jerk_penalty_strength: 1.0    # muc do phat rung giat
+  enable_motion_sampling: true  # lay mau theo quang duong chuyen dong tich luy (goc quay deu)
+  enable_denoising: true        # khu nhieu hat ISO bang bilateral filter giu nguyen canh sac
+  denoise_d: 5                  # duong kinh pixel loc bilateral
+  denoise_sigma_color: 25       # khu nhieu tren mat phang ma khong mo canh
+  denoise_sigma_space: 25       # ban kinh khong gian
 
 masking:             # Buoc 2
   prompt: "object"              # tu khoa nhan dien mac dinh: "object", "box", hoac chi dinh qua --prompt
@@ -31,30 +38,42 @@ masking:             # Buoc 2
   dilate_px: 0                  # 0: khong dilate; tang 2-5 neu vat the co vien mong
 
 reconstruction:
-  method: colmap_mvs            # splatfacto hoặc colmap_mvs
+  method: splatfacto            # splatfacto hoặc colmap_mvs
   pose_method: colmap       
   capture_mode: turntable
   matching_method: exhaustive   # exhaustive hoac sequential (dung sequential neu frame noi tiep deu)
-  sequential_overlap: 15        # so frame lan can khi dung sequential matching
-  sift_peak_threshold: 0.003    # nguong loc dac trung SIFT (0.002-0.004 giup bat dac trung vat the it texture nhu lo/coc)
-  sift_max_features: 8192       # so dac trung toi da moi frame
+  sequential_overlap: 20        # so frame lan can khi dung sequential matching
+  sift_peak_threshold: 0.001    # nguong loc dac trung SIFT (0.001 bat tron ven dac trung tren vat the it van/matte)
+  sift_max_features: 16384      # so dac trung toi da moi frame
+  matching_min_inliers: 8       # nguong dong thuan 2 goc nhin giup giu cac cap frame mat it texture
+  mapper_min_num_matches: 8
+  mapper_init_min_inliers: 20
+  mapper_abs_pose_min_inliers: 8
+  mapper_filter_max_reproj_error: 6.0
   min_pose_ratio: 0.5
   warn_pose_collapse: true      # canh bao khi quy dao camera bi ket/don cuc (gay ra song bien)
+  mvs_min_num_pixels: 2         # so luong camera dong thuan toi thieu (2 giup bat tron ven diem quay mobile/orbit)
+  mvs_max_reproj_error: 2.5     # nguong sai so chieu lai toi da (phu hop camera dien thoai)
 
 mesh_export:         # Buoc 4
-  mesh_mode: poisson           # obb (hop 6 mat) | poisson (be mat cong/phi phang) | both
-  poisson_depth: 7              # 7 giup be mat cong cang tron, muot ma; tang 8 neu can chi tiet cuc nho
-  poisson_density_quantile: 0.01 # 0.01 chi cat vien mo, khong bi rach lung vat the nhu 0.05
+  mesh_mode: both               # bpa (bam sat diem thuc te, giu chi tiet co khi) | poisson | both | obb
+  bpa_voxel_size: 0.008         # voxel lay mau cho BPA
+  bpa_r1_mult: 1.2              # he so ban kinh lan cap 1
+  bpa_r2_mult: 2.5              # he so ban kinh lan cap 2
+  bpa_r3_mult: 5.0              # he so ban kinh lan cap 3
+  poisson_depth: 8              # do sau Octree 8: can bang hoan hao giua do min va chi tiet quai xach
+  poisson_density_quantile: 0.0     # 0.0: cam tuyet doi cat theo quantile vi se duc thung lo tren nap va vach
+  poisson_linear_fit: true
   stat_nb: 20
-  stat_ratio: 2.0
+  stat_ratio: 1.5
   rad_nb: 5
   rad_radius_frac: 0.03
   cluster_eps_frac: 0.02        # ban kinh DBSCAN loc nhieu troi noi
   cluster_min_ratio: 0.03       # giu cac cum con >= 3% cum chinh (bao ve nap cam, quai xach khoi bi cat)
   cluster_min_points: 40
-  voxel_frac: 0.005             # hop nhat lop diem kep tranh tao gon song
-  normal_radius_frac: 0.07      # ban kinh tinh phap tuyen em ai, tranh giat cuc bo
-  normal_nn: 40
+  voxel_frac: 0.002             # giu ~250k diem chat luong cao, loai bo gai nhieu
+  normal_radius_local: 0.035    # ban kinh tinh phap tuyen phu hop kich thuoc hop (3.5cm)
+  normal_nn_local: 30
   orient_k: 15
   normal_smooth_iter: 2         # lam muot truong phap tuyen k-NN truoc khi dung Poisson
   normal_smooth_k: 25
@@ -66,16 +85,17 @@ mesh_export:         # Buoc 4
 
   # --- Lam min mesh so bo tai Buoc 4 ---
   smooth_type: "taubin"         # taubin (lam min khong teo the tich) hoac laplacian
-  smooth_iter: 30               # so vong lam min so bo (30 vong Taubin)
-  smooth_lambda: 0.5
-  smooth_mu: -0.53
-  polish_iter: 3                # so vong danh bong nhe nhàng so bo
+  smooth_iter: 15               # 15 vong Taubin triet tieu hoan toan nep gon song & sup lo
+  smooth_lambda: 0.35
+  smooth_mu: -0.37
+  polish_iter: 2                # 2 vong danh bong Laplacian nhu giay nhap min khu hat da dam nho
 
-  # false: giu dung 100% be mat thuc te cua vat the phi phang; true: bit phang day
-  make_watertight: false
+  # true: tu dong bit kin phang day (watertight solid); false: giu open surface
+  make_watertight: true
 
   # --- Loc mat phang ban xoay / de hoa van (RANSAC) ---
-  remove_table_plane: true      # tu dong cat bo mat phang ban xoay ma khong chem cheo vat the
+  # Dat false vi vat the da duoc tach nen boi SAM 2; neu bat true RANSAC se chem nham vao nap hop
+  remove_table_plane: false
   plane_dist_threshold_frac: 0.012 # nguong khoang cach xac dinh diem thuoc mat phang san
 
   # --- Cat phan thua ngoai vat the (vay Poisson) ---
@@ -105,17 +125,16 @@ completion:              # Hoan thien vung bi che lap theo Prompt + Anh Web (Dep
 mesh_refine:             # Buoc 5: Pipeline tinh chinh & lam min chuyen sau (chay doc lap hoac tu dong)
   auto_run: true                # tu dong chay ngay sau buoc 4
   align_upright: true           # bao toan can thang truc va dat sat san Z=0
-  smooth_mode: "bilateral_normal" # bilateral_normal (giu sac canh/chi tiet nho) | pymeshlab_twostep | taubin
-  bilateral_normal_iter: 6      # so vong loc phap tuyen song phuong (anisotropic)
-  bilateral_vertex_iter: 20     # so vong can chinh dinh theo phap tuyen da loc
-  bilateral_sigma_s_scale: 1.5  # ban kinh khong gian (boi so do dai canh trung binh)
-  bilateral_sigma_r: 0.38       # nguong bao ve canh sac (nho hon -> canh/khoa/quai cang sac)
-  bilateral_anchor_weight: 0.06 # luc neo giu dinh quan sat thuc te (w=1.0) khong bi troi/mo
-  detail_residual_transfer: false # bat true neu vat co chi tiet khac noi sieu nong can doi chieu lai MVS
-  detail_residual_strength: 0.25
-  taubin_iter: 45               # dung khi smooth_mode: "taubin"
-  taubin_lambda: 0.5
-  taubin_mu: -0.53
-  polish_iter: 4                # dung khi smooth_mode: "taubin"
+  smooth_mode: "taubin"         # taubin (lam min khong lam meo mo tam giac mat day)
+  taubin_iter: 10               # 10 vong Taubin tinh chinh sau Buoc 4
+  taubin_lambda: 0.35
+  taubin_mu: -0.37
+  polish_iter: 2                # 2 vong danh bong tinh che be mat láng nhua
+  polish_iter: 0                # 0: khong mai mon be mat
+  bilateral_normal_iter: 4      # dung khi smooth_mode: bilateral_normal
+  bilateral_vertex_iter: 10
+  bilateral_sigma_s_scale: 1.5
+  bilateral_sigma_r: 0.25
+  bilateral_anchor_weight: 0.08
   subdivide: false              # bat true neu can tang mat do luoi truoc khi lam min
   subdivide_method: "midpoint"  # midpoint hoac loop

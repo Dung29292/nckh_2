@@ -58,8 +58,18 @@ def refine_mesh(
     if ref_points is not None and ref_confidence is not None and len(ref_points) == len(ref_confidence):
         v_conf = interpolate_point_confidence_to_mesh(mesh, ref_points, ref_confidence)
 
+    # Loai bo toan bo manh vun / cum tam giac troi noi (floating fragments)
+    tri_clusters, n_tris, _ = mesh.cluster_connected_triangles()
+    tri_clusters = np.asarray(tri_clusters)
+    n_tris = np.asarray(n_tris)
+    if len(n_tris) > 1:
+        largest = n_tris.argmax()
+        mesh.remove_triangles_by_mask(tri_clusters != largest)
+        mesh.remove_unreferenced_vertices()
+        print(f"  Da loai bo {len(n_tris)-1:,} cum manh vun troi noi, giu lai cum vat the chinh ({n_tris[largest]:,} tam giac).")
+
     # --- Giai doan 2: Lam min be mat ---
-    smooth_mode = str(r_cfg.get("smooth_mode", "bilateral_normal")).strip().lower()
+    smooth_mode = str(r_cfg.get("smooth_mode", "pymeshlab_twostep")).strip().lower()
 
     if smooth_mode == "bilateral_normal":
         n_iter = int(r_cfg.get("bilateral_normal_iter", 6))
@@ -88,19 +98,11 @@ def refine_mesh(
         print(f"  PyMeshLab Two-Step Feature Smoothing: steps={steps}, normal_thr={norm_thr} deg")
 
     else:
-        # Legacy Taubin + Simple Polish
-        mesh.compute_triangle_normals()
-        tri_norms = np.asarray(mesh.triangle_normals)
-        is_box_mesh = len(tri_norms) > 0 and float(np.mean(np.max(np.abs(tri_norms), axis=1) > 0.94)) > 0.70
-
-        taubin_iter = int(r_cfg.get("taubin_iter", 45))
-        t_lam = float(r_cfg.get("taubin_lambda", 0.5))
-        t_mu = float(r_cfg.get("taubin_mu", -0.53))
-        polish_iter = int(r_cfg.get("polish_iter", 4))
-
-        if is_box_mesh:
-            taubin_iter = min(taubin_iter, 3)
-            polish_iter = 0
+        # Taubin Non-shrinking Mesh Polish (Tong quat cho moi loai mo hinh tu diem anh)
+        taubin_iter = int(r_cfg.get("taubin_iter", 10))
+        t_lam = float(r_cfg.get("taubin_lambda", 0.35))
+        t_mu = float(r_cfg.get("taubin_mu", -0.37))
+        polish_iter = int(r_cfg.get("polish_iter", 0))
 
         if taubin_iter > 0:
             mesh = mesh.filter_smooth_taubin(
@@ -108,7 +110,7 @@ def refine_mesh(
                 lambda_filter=t_lam,
                 mu=t_mu,
             )
-            print(f"  Taubin smoothing: {taubin_iter} vong (lambda={t_lam}, mu={t_mu})")
+            print(f"  Taubin smoothing (universal): {taubin_iter} vong (lambda={t_lam}, mu={t_mu})")
 
         if polish_iter > 0:
             mesh = mesh.filter_smooth_simple(number_of_iterations=polish_iter)
@@ -183,13 +185,19 @@ def run(sample_name: str, cfg: dict) -> None:
 
     # Chi chay PCA xoay lai neu Buoc 4 CHUA dong bo chung he truc voi point_cloud_clean.ply
     if r_cfg.get("align_upright", True) and len(mesh.vertices) > 0 and ref_confidence is None:
-        from .step4_mesh_export import _align_upright_and_ground
-        mesh = _align_upright_and_ground(mesh)
+        from .step4_mesh_export import _ground_mesh_z0
+        mesh = _ground_mesh_z0(mesh)
         has_colors = mesh.has_vertex_colors() and len(mesh.vertex_colors) == len(mesh.vertices)
         o3d.io.write_triangle_mesh(str(raw_obj), mesh, write_ascii=True, write_vertex_normals=True, write_vertex_colors=has_colors)
 
     t0 = time.time()
     mesh_refined = refine_mesh(mesh, r_cfg, ref_points=ref_points, ref_confidence=ref_confidence)
+
+    # Tiep dat Z=0 o buoc cuoi cung bang tinh tien truc tiep (bao toan 100% hinh hoc diem anh)
+    if r_cfg.get("align_upright", True) and len(mesh_refined.vertices) > 100:
+        from .step4_mesh_export import _ground_mesh_z0
+        mesh_refined = _ground_mesh_z0(mesh_refined)
+
     dur = time.time() - t0
 
     # Xuat ra file refined rieng va dong thoi cap nhat file chinh

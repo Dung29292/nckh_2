@@ -98,7 +98,8 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
     _run(extract)
 
     # Chay sequential matcher de lien ket cac frame lien tiep theo thoi gian
-    overlap = str(rc.get("sequential_overlap", 25))
+    overlap = str(rc.get("sequential_overlap", 20))
+    min_inliers = str(rc.get("matching_min_inliers", 8))
     seq_cmd = [
         "colmap", "sequential_matcher",
         "--database_path", str(db),
@@ -106,6 +107,7 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         "--FeatureMatching.guided_matching", "1",
         "--SequentialMatching.overlap", overlap,
         "--SequentialMatching.quadratic_overlap", "1",
+        "--TwoViewGeometry.min_num_inliers", min_inliers,
     ]
     _run(seq_cmd)
 
@@ -115,6 +117,7 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         "--database_path", str(db),
         "--FeatureMatching.use_gpu", "1",
         "--FeatureMatching.guided_matching", "1",
+        "--TwoViewGeometry.min_num_inliers", min_inliers,
     ]
     _run(exh_cmd)
 
@@ -123,9 +126,9 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         "--database_path", str(db),
         "--image_path", str(images),
         "--output_path", str(colmap_dir / "sparse"),
-        "--Mapper.min_num_matches", str(rc.get("mapper_min_num_matches", 10)),
-        "--Mapper.init_min_num_inliers", str(rc.get("mapper_init_min_inliers", 30)),
-        "--Mapper.abs_pose_min_num_inliers", str(rc.get("mapper_abs_pose_min_inliers", 15)),
+        "--Mapper.min_num_matches", str(rc.get("mapper_min_num_matches", 8)),
+        "--Mapper.init_min_num_inliers", str(rc.get("mapper_init_min_inliers", 20)),
+        "--Mapper.abs_pose_min_num_inliers", str(rc.get("mapper_abs_pose_min_inliers", 8)),
         "--Mapper.filter_max_reproj_error", str(rc.get("mapper_filter_max_reproj_error", 6.0)),
         "--Mapper.tri_ignore_two_view_tracks", "0",
     ])
@@ -334,6 +337,8 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
         else:
             raise
 
+    min_pixels = int(rc.get("mvs_min_num_pixels", 2))
+    max_reproj = float(rc.get("mvs_max_reproj_error", 2.5))
     fuse = [
         "colmap", "stereo_fusion",
         "--workspace_path", str(dense),
@@ -341,6 +346,8 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
         "--input_type", "geometric" if geom else "photometric",
         "--output_type", "PLY",
         "--output_path", str(dense / "fused.ply"),
+        "--StereoFusion.min_num_pixels", str(min_pixels),
+        "--StereoFusion.max_reproj_error", str(max_reproj),
     ]
     masks = sdir / "masks"
     if any(masks.glob("frame_*.png")):
