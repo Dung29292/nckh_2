@@ -3,42 +3,38 @@
 Vao : data/samples/<mau>/video.mp4
 Ra  : data/samples/<mau>/frames_sharp/frame_00001.jpg ...  + blur_scores.csv
 """
+from __future__ import annotations
+
 import csv
+from pathlib import Path
+from typing import Any
+
 import cv2
 import numpy as np
-from pathlib import Path
 from tqdm import tqdm
 
-from . import paths
+from nckh_2.core import paths
+from nckh_2.core.types import SceneContext, StageResult
 
 
 def compute_frame_sharpness(gray: np.ndarray) -> tuple[float, float, float, float]:
-    """Tinh to hop do net da chi tieu:
-    1. Tenengrad (nang luong gradient Sobel): do doc canh sac net, it bi anh huong boi nhieu ISO.
-    2. Directional Isotropy (ty le phuong sai gradient X vs Y): phat hien vet nhoe vet rung (motion blur streak).
-    3. Laplacian variance: chi so truyen thong.
-    4. Combined sharpness score: ket hop trong so ROI trung tam (75%) va toan khung hinh (25%).
-    """
+    """Tinh to hop do net da chi tieu (Tenengrad, Directional Isotropy, Laplacian variance)."""
     gh, gw = gray.shape
     y1, y2 = int(0.15 * gh), int(0.85 * gh)
     x1, x2 = int(0.20 * gw), int(0.80 * gw)
     roi = gray[y1:y2, x1:x2] if gh > 20 and gw > 20 else gray
 
-    # Sobel gradients
     gx = cv2.Sobel(roi, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(roi, cv2.CV_64F, 0, 1, ksize=3)
     tenengrad = float(np.mean(gx**2 + gy**2))
 
-    # Isotropy ratio [0, 1]: gan 1 la net deu cac huong; << 1 la bi nhoe theo 1 chieu (motion blur)
     vx, vy = float(np.var(gx)), float(np.var(gy))
     isotropy = min(vx, vy) / (max(vx, vy) + 1e-5)
 
-    # Laplacian variance
     lap_roi = float(cv2.Laplacian(roi, cv2.CV_64F).var())
     lap_global = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     lap_var = 0.75 * lap_roi + 0.25 * lap_global
 
-    # Diem ket hop
     combined = float(np.sqrt(tenengrad) * (isotropy ** 0.5) * (lap_var ** 0.25))
     return combined, tenengrad, isotropy, lap_var
 
@@ -47,27 +43,30 @@ def select_optimized_keyframes(
     scores: list[float],
     flow_mags: list[float],
     jerks: list[float],
-    cfg_b: dict
+    cfg_b: dict[str, Any],
+    laplacians: list[float] | None = None,
+    cfg_p: dict[str, Any] | None = None,
 ) -> list[int]:
-    """Lua chon keyframe toi uu:
-    - Khu rung: Phat diem cac frame co gia toc dot ngot (jerk spike) do tay lac/giat.
-    - Motion sampling: Lay mau theo quang duong goc quay thuc te (tich luy optical flow)
-      de dam bao mat do goc nhin 360 do phan bo dong deu, khong bi dut quang hay chong lap.
-    """
     scores_arr = np.asarray(scores, dtype=np.float64)
     flow_arr = np.asarray(flow_mags, dtype=np.float64)
     jerk_arr = np.asarray(jerks, dtype=np.float64)
+    lap_arr = np.asarray(laplacians, dtype=np.float64) if laplacians is not None else scores_arr
     n = len(scores_arr)
-    max_frames = int(cfg_b.get("max_frames", 60))
+
+    prep = cfg_p or {}
+    target_frames = int(prep.get("target_frames", cfg_b.get("max_frames", 90)))
+    max_frames_cap = int(prep.get("max_frames_cap", max(target_frames, 95)))
+    max_frames = max(1, min(target_frames, max_frames_cap))
+    min_sharpness = float(prep.get("min_sharpness_score", 0.0))
+    min_parallax = float(prep.get("min_parallax_flow", 0.0))
+    oversample_factor = float(prep.get("oversample_factor", 2.5))
 
     if n <= max_frames:
         return list(range(n))
 
-    # 1. Tinh he so phat rung giat
     if cfg_b.get("enable_shake_filter", True) and len(jerk_arr) > 1:
         jerk_p85 = float(np.percentile(jerk_arr, 85))
         penalty_strength = float(cfg_b.get("jerk_penalty_strength", 1.0))
-        # Frame co gia toc vuot P85 bi phat ty le nghich
         shake_weight = 1.0 / (1.0 + penalty_strength * np.maximum(0.0, (jerk_arr - jerk_p85) / (jerk_p85 + 1e-5)))
     else:
         shake_weight = np.ones(n, dtype=np.float64)
@@ -75,54 +74,80 @@ def select_optimized_keyframes(
     quality = scores_arr * shake_weight
     median_q = float(np.median(quality))
     min_ratio = float(cfg_b.get("min_ratio", 0.6))
-    threshold = min_ratio * median_q
+    adaptive_q_thr = min_ratio * median_q
 
-    # 2. Lay mau theo quang duong chuyen dong (Motion-Cumulative Trajectory)
-    if cfg_b.get("enable_motion_sampling", True) and len(flow_arr) == n:
-        # Tich luy quang duong chuyen dong (dam bao luon tien ve phia truoc)
-        cum_motion = np.cumsum(np.clip(flow_arr, 0.2, None))
-        total_motion = cum_motion[-1]
-        step_motion = total_motion / max_frames
+    # 1. Oversampling along timeline (~2.0x-2.5x target budget)
+    n_oversample = min(n, max(max_frames, int(round(max_frames * oversample_factor))))
+    cand_indices = np.unique(np.linspace(0, n - 1, n_oversample).round().astype(int))
+    cand_mask = np.zeros(n, dtype=bool)
+    cand_mask[cand_indices] = True
 
-        chosen = []
-        last_idx = -1
-        # Cua so tim kiem cuc bo quanh moc quang duong
-        search_radius = max(5, int(n / (max_frames * 2)))
+    # 2. Motion / Parallax verification: skip near-static segments (flow < min_parallax)
+    motion_mask = np.ones(n, dtype=bool)
+    if min_parallax > 0.0 and len(flow_arr) == n:
+        moving = flow_arr >= min_parallax
+        moving[0] = True  # always allow first frame
+        if int(np.sum(moving & cand_mask)) >= max_frames:
+            motion_mask = moving
 
-        for k in range(max_frames):
-            target = k * step_motion
-            center_idx = int(np.searchsorted(cum_motion, target))
-            w_start = max(last_idx + 1, center_idx - search_radius)
-            w_end = min(n, center_idx + search_radius + 1)
-
-            if w_start >= w_end:
-                cand = min(n - 1, last_idx + 1)
-            else:
-                window_scores = quality[w_start:w_end]
-                best_sub = int(np.argmax(window_scores))
-                cand = w_start + best_sub
-
-            chosen.append(cand)
-            last_idx = cand
-    else:
-        # Che do cua so co dinh co loc nguong
-        window = int(cfg_b.get("window", 5))
-        candidates = []
-        for start in range(0, n, window):
-            seg = quality[start:start + window]
-            i = start + int(np.argmax(seg))
-            if quality[i] >= threshold:
-                candidates.append(i)
-        if len(candidates) > max_frames:
-            pick = np.linspace(0, len(candidates) - 1, max_frames).round().astype(int)
-            chosen = [candidates[j] for j in pick]
+    # 3. Sharpness filtering via Laplacian Variance (dynamic + adaptive fallback)
+    valid_mask = cand_mask & motion_mask & (quality >= adaptive_q_thr)
+    if min_sharpness > 0.0:
+        lap_valid = lap_arr >= min_sharpness
+        if int(np.sum(valid_mask & lap_valid)) >= max_frames:
+            valid_mask = valid_mask & lap_valid
+        elif int(np.sum(cand_mask & motion_mask & lap_valid)) >= max_frames:
+            valid_mask = cand_mask & motion_mask & lap_valid
         else:
-            chosen = candidates
+            pool_size = max(max_frames, int(prep.get("candidate_pool_size", n_oversample)))
+            k_pool = min(n, pool_size)
+            top_lap_thr = float(np.partition(lap_arr, n - k_pool)[n - k_pool])
+            valid_mask = motion_mask & (lap_arr >= top_lap_thr)
 
-    return chosen
+    if int(np.sum(valid_mask)) < max_frames:
+        top_q_thr = float(np.partition(quality, n - max_frames)[n - max_frames])
+        valid_mask = quality >= top_q_thr
+
+    # 4. Uniform Budget Binning into `max_frames` equidistant intervals
+    if cfg_b.get("enable_motion_sampling", True) and len(flow_arr) == n:
+        cum_coord = np.cumsum(np.clip(flow_arr, 0.2, None))
+    else:
+        cum_coord = np.arange(1, n + 1, dtype=np.float64)
+
+    edges = np.linspace(float(cum_coord[0]), float(cum_coord[-1]), max_frames + 1)
+    chosen_set: set[int] = set()
+    chosen: list[int] = []
+
+    for k in range(max_frames):
+        lo = edges[k]
+        hi = edges[k + 1]
+        if k == max_frames - 1:
+            in_bin = (cum_coord >= lo) & (cum_coord <= hi)
+        else:
+            in_bin = (cum_coord >= lo) & (cum_coord < hi)
+
+        cands = np.nonzero(in_bin & valid_mask)[0]
+        if len(cands) == 0:
+            cands = np.nonzero(in_bin)[0]
+
+        cands = [int(i) for i in cands if int(i) not in chosen_set]
+        if cands:
+            best_i = max(cands, key=lambda idx: float(quality[idx]))
+            chosen_set.add(best_i)
+            chosen.append(best_i)
+
+    # Bo sung tu cac ung vien sac net nhat neu co bin rong do quang duong khong deu
+    if len(chosen) < max_frames:
+        remaining = [int(i) for i in np.argsort(-quality) if int(i) not in chosen_set]
+        for idx in remaining[: max_frames - len(chosen)]:
+            chosen_set.add(idx)
+            chosen.append(idx)
+
+    chosen.sort()
+    return chosen[:max_frames]
 
 
-def run(sample_name: str, cfg: dict) -> None:
+def run(sample_name: str, cfg: dict[str, Any]) -> None:
     b = cfg["blur_filter"]
     sdir = paths.sample_dir(sample_name)
     video = sdir / cfg["video_file"]
@@ -145,7 +170,6 @@ def run(sample_name: str, cfg: dict) -> None:
     prev_gray = None
     prev_mag = 0.0
 
-    # Luot 1: Quet video, do luong do net, dong chay quang hoc va do rung giat
     pbar = tqdm(total=total, desc="Buoc 1a: Phan tich do net & do rung giat (Anti-Shake)")
     while True:
         ok, frame = cap.read()
@@ -157,14 +181,12 @@ def run(sample_name: str, cfg: dict) -> None:
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gh, gw = gray.shape
 
-        # Tinh to hop do net
         comb_score, ten, iso, lap = compute_frame_sharpness(gray)
         scores.append(comb_score)
         tenengrads.append(ten)
         isotropies.append(iso)
         laplacians.append(lap)
 
-        # Tinh optical flow tren vung trong tam
         if prev_gray is not None:
             flow = dis.calc(prev_gray, gray, None)
             y1, y2 = int(0.15 * gh), int(0.85 * gh)
@@ -188,8 +210,14 @@ def run(sample_name: str, cfg: dict) -> None:
     if not scores:
         raise RuntimeError("Video rong hoac khong doc duoc.")
 
-    # Lua chon cac frame toi uu nhat
-    keep = select_optimized_keyframes(scores, flow_mags, jerks, b)
+    keep = select_optimized_keyframes(
+        scores,
+        flow_mags,
+        jerks,
+        b,
+        laplacians=laplacians,
+        cfg_p=cfg.get("preprocess", {}),
+    )
     keep_set = set(keep)
 
     out = sdir / "frames_sharp"
@@ -197,7 +225,6 @@ def run(sample_name: str, cfg: dict) -> None:
     for old in out.glob("frame_*.jpg"):
         old.unlink()
 
-    # Luot 2: Trinh xuat va khu nhieu hat ISO bang bilateral filter giu nguyen canh sac
     enable_denoise = bool(b.get("enable_denoising", True))
     d = int(b.get("denoise_d", 5))
     sc = float(b.get("denoise_sigma_color", 25))
@@ -217,7 +244,6 @@ def run(sample_name: str, cfg: dict) -> None:
             if scale < 1.0:
                 frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-            # Khử nhiễu bề mặt phẳng nhưng giữ nguyên 100% cạnh góc cạnh chi tiết
             if enable_denoise:
                 frame = cv2.bilateralFilter(frame, d=d, sigmaColor=sc, sigmaSpace=ss)
 
@@ -231,7 +257,6 @@ def run(sample_name: str, cfg: dict) -> None:
     cap.release()
     pbar.close()
 
-    # Luu file nhat ky chi tiet
     csv_path = sdir / "blur_scores.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
@@ -245,10 +270,9 @@ def run(sample_name: str, cfg: dict) -> None:
                 f"{laplacians[i]:.2f}",
                 f"{flow_mags[i]:.2f}",
                 f"{jerks[i]:.2f}",
-                int(i in keep_set)
+                int(i in keep_set),
             ])
 
-    # Luu bieu do danh gia chat luong Buoc 1
     report_dir = paths.output_dir(sample_name) / "motion_analysis"
     report_dir.mkdir(parents=True, exist_ok=True)
     report_fig = report_dir / "step1_shake_blur_optimization.png"
@@ -259,7 +283,7 @@ def run(sample_name: str, cfg: dict) -> None:
         plt.plot(scores, color="#2b5c8f", label="Chi so Do net To hop (Tenengrad x Isotropy x Laplacian)", alpha=0.7)
         kept_indices = [i for i in keep]
         kept_scores = [scores[i] for i in keep]
-        plt.scatter(kept_indices, kept_scores, color="#e63946", s=35, zorder=5, label=f"60 Frame duoc chon (Net nhat, Khong rung giat)")
+        plt.scatter(kept_indices, kept_scores, color="#e63946", s=35, zorder=5, label=f"{len(keep)} Frame duoc chon")
         plt.title(f"Danh gia Buoc 1: Loc Net & Chon Keyframe Toi uu ({sample_name})")
         plt.ylabel("Do net")
         plt.grid(True, linestyle="--", alpha=0.5)
@@ -269,7 +293,7 @@ def run(sample_name: str, cfg: dict) -> None:
         plt.plot(flow_mags, color="#2a9d8f", label="Van toc di chuyen (Optical Flow speed)", alpha=0.7)
         plt.plot(jerks, color="#e76f51", label="Do rung giat / Gia toc (Jerk)", alpha=0.5)
         kept_jerks = [jerks[i] for i in keep]
-        plt.scatter(kept_indices, kept_jerks, color="#264653", s=30, zorder=5, label="Do rung cua cac frame duoc chon (rat thap)")
+        plt.scatter(kept_indices, kept_jerks, color="#264653", s=30, zorder=5, label="Do rung cua frame duoc chon")
         plt.xlabel("Thu tu frame trong video goc")
         plt.ylabel("Diem van toc / Rung")
         plt.grid(True, linestyle="--", alpha=0.5)
@@ -283,4 +307,13 @@ def run(sample_name: str, cfg: dict) -> None:
     mean_jerk_kept = np.mean([jerks[i] for i in keep]) if keep else 0.0
     mean_sharp_kept = np.mean([scores[i] for i in keep]) if keep else 0.0
     print(f"[Buoc 1] Hoan tat! {len(scores)} frame -> giu {n} frame net nhat (Do net TB: {mean_sharp_kept:.1f}, Do rung giat TB: {mean_jerk_kept:.2f}) -> {out}")
-    print(f"[Buoc 1] Bieu do kiem dinh da luu tai: {report_fig}")
+
+
+class BlurFilterStage:
+    stage_id = 1
+    title = "Loc frame mo"
+
+    def execute(self, ctx: SceneContext) -> StageResult:
+        run(ctx.sample_name, ctx.config)
+        ctx.artifacts["frames_sharp"] = ctx.sample_dir / "frames_sharp"
+        return StageResult(stage_id=self.stage_id, stage_name=self.title, success=True, artifacts=ctx.artifacts)

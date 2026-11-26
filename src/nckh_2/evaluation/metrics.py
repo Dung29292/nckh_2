@@ -1,14 +1,4 @@
-"""Phase 5: Quantitative 3D reconstruction & detail-retention evaluation harness.
-
-Measures:
-  - Global & split Chamfer Distance (Observed vs Occluded regions)
-  - Precision, Recall, and F-Score @ tau (1% and 2% of bounding diagonal)
-  - Normal Consistency (NC)
-  - Detail-Retention Metrics:
-      * High-Curvature Chamfer (CD_edge) on top 10% discrete-curvature crease vertices
-      * Curvature Preservation Ratio (CPR -> 1.0 ideal; < 0.6 indicates over-smoothing)
-      * Flat-Panel Normal Variance (sigma2_flat -> lower means smoother flat panels)
-"""
+"""He thong do luong & danh gia dinh luong tai tao 3D va bao toan chi tiet be mat."""
 from __future__ import annotations
 
 import dataclasses
@@ -18,7 +8,11 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
-from .detail_smooth import _build_face_adjacency, _compute_face_geometry, compute_discrete_curvature
+from nckh_2.backends.smoothing import (
+    _build_face_adjacency,
+    _compute_face_geometry,
+    compute_discrete_curvature,
+)
 
 
 @dataclasses.dataclass
@@ -90,7 +84,6 @@ def compute_surface_metrics(
     prec1, rec1, f1_1 = _fscore(0.01 * diag)
     _, _, f1_2 = _fscore(0.02 * diag)
 
-    # Normal Consistency (absolute cosine handles orientation-invariant comparison robustly)
     nc_p2g = float(np.mean(np.abs(np.sum(norms_pred * norms_gt[idx_p2g], axis=1))))
     nc_g2p = float(np.mean(np.abs(np.sum(norms_gt * norms_pred[idx_g2p], axis=1))))
     nc = 0.5 * (nc_p2g + nc_g2p)
@@ -111,7 +104,6 @@ def evaluate_reconstruction_split(
     occluded_fn: Callable[[np.ndarray], np.ndarray],
     n_samples: int = 20000,
 ) -> dict[str, dict[str, float]]:
-    """Evaluate predicted mesh against GT separately on All, Observed, and Occluded regions."""
     pts_p, n_p = _sample_surface(mesh_pred, n_samples)
     pts_g, n_g = _sample_surface(mesh_gt, n_samples)
     diag = float(np.linalg.norm(pts_g.max(axis=0) - pts_g.min(axis=0)))
@@ -131,7 +123,6 @@ def evaluate_reconstruction_split(
 
 
 def _flat_panel_normal_variance(mesh: o3d.geometry.TriangleMesh, flat_face_mask: np.ndarray) -> float:
-    """Measure area-weighted topological 1-ring normal variance across flat faces (lower = smoother)."""
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     tris = np.asarray(mesh.triangles, dtype=np.int32)
     if len(tris) == 0 or not np.any(flat_face_mask):
@@ -152,7 +143,6 @@ def evaluate_detail_preservation(
     mesh_smoothed: o3d.geometry.TriangleMesh,
     mesh_clean_gt: o3d.geometry.TriangleMesh | None = None,
 ) -> DetailRetentionMetrics:
-    """Quantify sharpness retention (CPR & CD_edge) vs flat-panel noise removal."""
     ref_mesh = mesh_clean_gt if mesh_clean_gt is not None else mesh_noisy
     curv_ref = compute_discrete_curvature(ref_mesh)
     curv_after = compute_discrete_curvature(mesh_smoothed)
@@ -165,7 +155,6 @@ def evaluate_detail_preservation(
     if not np.any(edge_mask):
         edge_mask = np.ones(len(v_ref), dtype=bool)
 
-    # Map high-curvature reference vertices onto smoothed mesh (handles different vertex counts too)
     tree_after = cKDTree(v_after)
     d_edge, idx_edge = tree_after.query(v_ref[edge_mask], k=1)
     cd_edge = float(np.mean(d_edge))
@@ -174,7 +163,6 @@ def evaluate_detail_preservation(
     after_edge_c = float(np.mean(curv_after[idx_edge]))
     cpr = after_edge_c / max(ref_edge_c, 1e-8)
 
-    # Flat-panel normal variance before vs after smoothing (on bottom 50% curvature faces)
     tris_n = np.asarray(mesh_noisy.triangles, dtype=np.int32)
     curv_noisy_v = compute_discrete_curvature(mesh_noisy)
     face_curv = curv_noisy_v[tris_n].mean(axis=1)
@@ -200,19 +188,16 @@ def evaluate_detail_preservation(
 
 
 def build_synthetic_detailed_box(subdiv_iters: int = 4) -> o3d.geometry.TriangleMesh:
-    """Create a synthetic toolbox with sharp edges, protruding front latch & top handle for ablation tests."""
+    """Tao mo hinh hop chi tiet sac net dung cho ablation & regression tests."""
     body = o3d.geometry.TriangleMesh.create_box(width=2.0, height=1.3, depth=1.0)
     body.translate([-1.0, -0.65, 0.0])
     body = body.subdivide_midpoint(number_of_iterations=subdiv_iters)
 
     verts = np.asarray(body.vertices, dtype=np.float64).copy()
-    # Sculpt protruding front latch on -Y face
     is_latch = (verts[:, 1] < -0.64) & (np.abs(verts[:, 0]) < 0.25) & (verts[:, 2] > 0.40) & (verts[:, 2] < 0.85)
     verts[is_latch, 1] -= 0.12
-    # Sculpt raised top handle on +Z face
     is_handle = (verts[:, 2] > 0.99) & (np.abs(verts[:, 0]) < 0.45) & (np.abs(verts[:, 1]) < 0.14)
     verts[is_handle, 2] += 0.14
-    # Sculpt lid overhang step around z > 0.72
     is_lid = (verts[:, 2] > 0.72) & ((np.abs(verts[:, 0]) > 0.99) | (np.abs(verts[:, 1]) > 0.64))
     verts[is_lid, 0] *= 1.04
     verts[is_lid, 1] *= 1.05

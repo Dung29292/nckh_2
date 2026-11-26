@@ -1,5 +1,20 @@
 video_file: video.mp4
 
+numerical:
+  norm_eps: 1.0e-12             # minimum vector norm guard
+  area_eps: 1.0e-12             # minimum triangle double-area guard
+  svd_reg_eps: 1.0e-6           # Tikhonov ridge regularization for quadratic Monge MLS
+  sdf_zero_tol: 1.0e-4          # Eq. (9): |s| <= sdf_zero_tol classified on zero-level surface
+
+surface_router:                 # Section 1 & 6: Automatic pre-fitting problem classification
+  mode: "auto"                  # auto | freeform_object | architectural_planar | room_layout | topdown_object
+  room_min_extent_m: 2.20       # scenes larger than this metric span with vertical walls -> architectural/room
+  planar_normal_peak_ratio: 0.58 # fraction of normals concentrated in <= 6 orthogonal peaks -> planar/CAD
+  vertical_wall_min_ratio: 0.35 # fraction of horizontal normals (nz ~ 0) indicating vertical walls
+  enclosure_min_walls: 3        # >= 3 distinct vertical wall directions -> full room_layout (Top-down M5)
+  histogram_azimuth_bins: 36
+  histogram_elevation_bins: 18
+
 record:
   camera: 0
   width: 1280
@@ -11,11 +26,19 @@ record:
   mobile_fps: 60
   mobile_quality: 0.70
 
+preprocess:          # Buoc 1: Quality-driven keyframe selection (~90 sharp frames, 85-95 gate)
+  target_frames: 90             # Target ~90 equidistant sharp keyframes
+  oversample_factor: 2.5        # Oversample ~2.0x-2.5x (~200-225 candidates) along timeline
+  min_sharpness_score: 100.0    # Dynamic Laplacian variance threshold
+  min_parallax_flow: 0.8        # Minimum optical flow (px at score_width) to skip static segments
+  max_frames_cap: 95            # Hard ceiling for [85, 95] gate and 6GB VRAM safety
+  candidate_pool_size: 225      # Over-sampled sharp candidate pool before temporal spread
+
 blur_filter:         # Buoc 1: Loc mo, khu rung giat va khu nhieu ISO
   score_width: 480              # do rong frame de tinh nhanh do net & optical flow
   window: 5                     # cua so xet cuc bo
   min_ratio: 0.6                # nguong toi thieu theo trung vi do net
-  max_frames: 60                # so frame toi uu cho khoi tao va tai tao 3D
+  max_frames: 90                # dong bo voi preprocess.target_frames (~90)
   save_max_side: 1920           # chieu dai toi da khi xuat anh
   jpg_quality: 95               # chat luong jpeg cao
   enable_shake_filter: true     # khu rung: phat hien va phat diem frame co gia toc dot ngot (jerk)
@@ -40,72 +63,137 @@ masking:             # Buoc 2
   dilate_px: 0                  # 0: khong dilate; tang 2-5 neu vat the co vien mong
 
 reconstruction:
-  method: splatfacto            # splatfacto hoặc colmap_mvs
-  pose_method: colmap       
+  method: colmap_mvs           # COLMAP Dense MVS (deterministic geometry + native normals)
+  pose_method: colmap
   capture_mode: turntable
-  matching_method: exhaustive   # exhaustive hoac sequential (dung sequential neu frame noi tiep deu)
-  sequential_overlap: 20        # so frame lan can khi dung sequential matching
-  sift_peak_threshold: 0.001    # nguong loc dac trung SIFT (0.001 bat tron ven dac trung tren vat the it van/matte)
-  sift_max_features: 16384      # so dac trung toi da moi frame
-  matching_min_inliers: 8       # nguong dong thuan 2 goc nhin giup giu cac cap frame mat it texture
-  mapper_min_num_matches: 8
-  mapper_init_min_inliers: 20
-  mapper_abs_pose_min_inliers: 8
-  mapper_filter_max_reproj_error: 6.0
+  camera_model: OPENCV         # Shared radial + tangential lens distortion model
+  single_camera: true          # Enforce shared intrinsic matrix K across all frames
+  matching_method: exhaustive  # Sequential + loop closure + exhaustive all-pairs
+  sequential_overlap: 20       # Wide sequential window (18-20 frames)
+  loop_detection: true         # Mandatory loop closure (final 20% <-> initial 20%)
+  loop_detection_period: 10    # Loop closure check period (10-12 frames)
+  vocab_tree_path: ""          # Optional local COLMAP vocab tree .bin path (offline safe)
+  sift_peak_threshold: 0.001   # nguong loc dac trung SIFT (0.001 bat tron ven dac trung tren vat the it van/matte)
+  sift_max_features: 16384     # so dac trung toi da moi frame
+  matching_min_inliers: 12     # nguong dong thuan 2 goc nhin chong ghep sai / dual shell
+  mapper_min_num_matches: 12
+  mapper_init_min_inliers: 25
+  mapper_abs_pose_min_inliers: 12
+  mapper_filter_max_reproj_error: 4.0
   min_pose_ratio: 0.5
-  warn_pose_collapse: true      # canh bao khi quy dao camera bi ket/don cuc (gay ra song bien)
-  mvs_min_num_pixels: 2         # so luong camera dong thuan toi thieu (2 giup bat tron ven diem quay mobile/orbit)
-  mvs_max_reproj_error: 2.5     # nguong sai so chieu lai toi da (phu hop camera dien thoai)
+  warn_pose_collapse: true     # canh bao khi quy dao camera bi ket/don cuc (gay ra song bien)
+  mvs_max_image_size: 1400     # Cap 1400-1600 px de giu peak VRAM < 5.5 GB
+  mvs_geom_consistency: false  # Photometric consistency + min 3 views (nhanh & an toan VRAM)
+  mvs_min_num_pixels: 3        # Toi thieu 3 goc nhin dong thuan (diet floater fins)
+  mvs_max_reproj_error: 2.0    # Nguong sai so chieu lai chat che hon cho MVS fusion
 
-mesh_export:         # Buoc 4
-  mesh_mode: both               # bpa (bam sat diem thuc te, giu chi tiet co khi) | poisson | both | obb
+mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 12 Poisson -> Taubin)
+  mesh_mode: poisson            # poisson (primary watertight mesher) | bpa | both
   bpa_voxel_size: 0.008         # voxel lay mau cho BPA
+  bpa_voxel_frac: 0.004
+  bpa_max_points: 250000
   bpa_r1_mult: 1.2              # he so ban kinh lan cap 1
   bpa_r2_mult: 2.5              # he so ban kinh lan cap 2
   bpa_r3_mult: 5.0              # he so ban kinh lan cap 3
-  poisson_depth: 8              # do sau Octree 8: can bang hoan hao giua do min va chi tiet quai xach
-  poisson_density_quantile: 0.015   # 1.5%: cat gon gang bong bong ngoai vi de lo chu trinh bien sach se
-  poisson_density_trim_percentile: 4
+  poisson_depth: 8              # Eq. (12) Delta chi = div V: Octree depth 8 (can bang chi tiet & watertight)
+  poisson_scale: 1.1
+  poisson_density_quantile: 0.075 # cat 7.5% dinh mat do thap nhat de chong bong bong ngoai suy
+  poisson_density_trim_percentile: 0.0 # du phong theo % neu poisson_density_quantile = 0
+  poisson_max_dist_frac: 0.0    # 0.0 = khong cat xa theo khoang cach (tranh xe rach mat vat the)
+  poisson_cluster_keep_ratio: 0.15 # giu khoi vat the chinh, loai bo manh vo troi noi
   poisson_linear_fit: true
-  stat_nb: 20
-  stat_ratio: 1.5
-  rad_nb: 5
+  gaussian_opacity_min: 0.20    # nguong loc opacity khi doc 3DGS .ply
+  stat_nb: 35                   # SOR chat che (k=35, std_ratio=0.9) de cat sach floater fins
+  stat_ratio: 0.9
+  rad_nb: 16
   rad_radius_frac: 0.02
   cluster_eps_frac: 0.02        # ban kinh DBSCAN loc nhieu troi noi
-  cluster_min_ratio: 0.10       # giu cac cum con >= 3% cum chinh (bao ve nap cam, quai xach khoi bi cat)
+  cluster_min_ratio: 0.10       # loai bo cum nho / floater tach roi khoi than vat the
   cluster_min_points: 40
   voxel_frac: 0.002             # giu ~250k diem chat luong cao, loai bo gai nhieu
-  normal_radius_local: 0.035    # ban kinh tinh phap tuyen phu hop kich thuoc hop (3.5cm)
+  recompute_normals: true       # luon uoc luong lai phap tuyen bang KDTree hybrid + consistent tangent plane
+  normal_radius_frac: 0.015
+  normal_radius_local: 0.035    # ban kinh tinh phap tuyen
+  normal_nn: 30
   normal_nn_local: 30
   orient_k: 15
-  normal_smooth_iter: 2         # lam muot truong phap tuyen k-NN truoc khi dung Poisson
+  normal_smooth_iter: 3         # lam muot truong phap tuyen k-NN (Bilateral) truoc khi dung Poisson
   normal_smooth_k: 25
+  normal_smooth_sigma_deg: 35.0 # 35 deg: can bang giua mat cong muot va canh goc 90 do
 
-  # --- Tien xu ly lam muot point cloud (MLS: Moving Least Squares) ---
-  mls_iter: 1                   # 1 vong MLS chieu diem ve tiep dien cuc bo, triet tieu ranh khia
-  mls_neighbors: 30             # so diem lang gieng fit tiep dien
-  mls_alpha: 0.75               # do em chieu diem (0.7-0.85 giu form dang nhung xoa gon song)
+  # --- Tien xu ly tiep dien vi phan cuc bo (Eq. 6: Local Quadratic Monge Patch MLS) ---
+  mls_iter: 2                   # so vong chieu MLS Monge bậc 2 z = c0 + c1*x + c2*y + c3*x^2 + c4*x*y + c5*y^2
+  mls_polynomial_order: 2       # 2 = exact quadratic Monge paraboloid (Eq. 6); 1 = planar tangent
+  mls_neighbors: 30             # k-NN lang gieng cuc bo
+  mls_radius_frac: 0.035        # ban kinh R tuong doi theo robust_diag (0 = chi gioi han theo k-NN)
+  mls_weight_bandwidth_frac: 0.020 # Gaussian kernel bandwidth h cho trong so cuc bo MLS
+  mls_alpha: 0.78               # he so chieu diem ve paraboloid tiep dien
+  mls_outlier_sigma: 3.0        # nguong MAD loai bo diem ngoai lai xa mat tiep dien
+  mls_recompute_normals: true   # cap nhat phap tuyen vi sai [-c1, -c2, 1] / sqrt(1 + c1^2 + c2^2)
+  mls_chunk_size: 40000
 
-  # --- Lam min mesh so bo tai Buoc 4 ---
+  # --- Lam min Taubin bao toan the tich (Section 3.4: lambda > 0, mu < -lambda) ---
   smooth_type: "taubin"         # taubin (lam min khong teo the tich) hoac laplacian
-  smooth_iter: 15               # 15 vong Taubin triet tieu hoan toan nep gon song & sup lo
-  smooth_lambda: 0.35
-  smooth_mu: -0.37
-  polish_iter: 2                # 2 vong danh bong Laplacian nhu giay nhap min khu hat da dam nho
+  smooth_iter: 12               # so chu ky hai buoc luan phien (10-15 iters)
+  smooth_lambda: 0.5            # buoc co nhe (lambda > 0)
+  smooth_mu: -0.53              # buoc phong doi khang (mu < -lambda) chong co rut the tich
+  polish_iter: 0                # 0: khong mai mon canh sac
 
-  # true: tu dong bit kin phang day (watertight solid); false: giu open surface
+  # true: tu dong cat phang day & bit kin 2D Delaunay/Ear-clipping thanh khoi 2-manifold watertight
   make_watertight: true
+  planar_base_cap: true         # Object-agnostic planar base slicing & 2D polygon capping
+  base_slice_frac: 0.035        # Cat bo 3.5% vay thap mat do thap o chan day truoc khi bit phang
+  floor_snap_frac: 0.02
 
-  # --- Loc mat phang ban xoay / de hoa van (RANSAC) ---
-  # Dat false vi vat the da duoc tach nen boi SAM 2; neu bat true RANSAC se chem nham vao nap hop
-  remove_table_plane: false
-  plane_dist_threshold_frac: 0.012 # nguong khoang cach xac dinh diem thuoc mat phang san
+  # --- Loc mat phang ban xoay / de hoa van (Dual-Validated RANSAC) ---
+  remove_table_plane: true      # tu dong tach & cat phang mat ban/de xoay duoi day vat the
+  plane_dist_threshold_frac: 0.015 # nguong khoang cach xac dinh diem thuoc mat phang san
+  plane_normal_max_angle_deg: 15.0 # Eq. (10) goc lech phap tuyen toi da
+  plane_ransac_iterations: 1500
+  plane_inlier_ratio_range: [0.25, 0.70] # ty le diem mat ban (25-70%) tranh cat vao nap hop
+  plane_one_sided_min_ratio: 0.75 # 75%: vat the phai nam hoan toan ve 1 phia ben tren mat ban
+  plane_orbit_min_cos: 0.65     # mat ban phu hop goc nghieng camera orbit (>= 40 do)
+  table_clearance_frac: 0.006   # cat sach ria chan mat ban
 
   # --- Cat phan thua ngoai vat the (vay Poisson) ---
   poisson_hull_pad_frac: 0.03
 
   # --- Can thang dung (Z-up) & dat len mat san (Z=0) ---
   align_upright: true           # tu dong can thang truc Z-up, dua ve goc (0,0) va tiep dat sat san Z=0
+
+  # --- Bu khuyet vat the bang noi suy (Per-Component Symmetry + Visual Hull + Biharmonic, 0 VRAM) ---
+  interpolation_fill:
+    enable: true                # tu dong noi suy lap lo vung tron/che khuat truoc khi dung Poisson
+    use_visual_hull: true       # dung Mask Buoc 2 + Camera COLMAP lam bien chan ngoai
+    visual_hull_res: 64         # do phan giai luoi voxel Visual Hull
+    visual_hull_pad_frac: 0.25  # bien dem sat vat the
+    visual_hull_consistency: 0.80 # ty le goc nhin dong thuan
+    use_symmetry: true          # noi suy doi xung cuc bo cho tung vat the (tu bo qua neu bat doi xung)
+    symmetry_min_overlap: 0.72  # chi nhan mat phang doi xung neu ICP overlap >= 72%
+    use_biharmonic: true        # chi lap lo khuyet NOI VI ben trong bong vat the
+    virtual_view_size: 256      # do phan giai camera ao (nhanh ~2-3s, 0 VRAM)
+    max_added_ratio: 0.60       # gioi han diem noi suy <= 60% diem thuc
+
+topdown_residual:    # Section 4: Top-Down Canonical Shape P_canonical(theta) + Residual d_i * n_base,i
+  enable: false                 # bat true (hoac qua router/profile) cho ep khuon dan hoi Top-down
+  prior_type: "superquadric"    # superquadric (Eq. 14) | poisson_base
+  superquadric:
+    init_eps1: 0.85             # Eq. (14) exponent z-roundness (1.0 = ellipsoid, ->0 = sharp box)
+    init_eps2: 0.85             # Eq. (14) exponent xy-roundness
+    min_exponent: 0.08          # numerical clamp avoiding float64 power overflow
+    max_exponent: 2.50
+    pca_inlier_mad_sigma: 3.5   # deterministic MAD radial filter protecting closed-form PCA from floaters
+    pca_extent_quantiles: [1.0, 99.0]
+    optimize_exponents: true    # refine (eps1, eps2) deterministically over grid/Gauss-Newton
+    exponent_grid: [0.20, 0.50, 0.85, 1.00, 1.35]
+    uv_resolution: [64, 128]    # canonical base mesh tessellation (rings, sectors)
+  elastic_energy:               # Eq. (16): E_total = E_data + lambda_smooth * E_smoothness
+    lambda_smooth: 0.15         # membrane smoothness weight (elastic resistance against outliers)
+    biharmonic_weight: 0.05     # thin-plate bending weight beta * ||L d||^2
+    huber_delta_frac: 0.025     # robust Huber threshold (fraction of bbox_diag) rejecting floaters
+    max_displacement_frac: 0.12 # physical clamp on |d_i| relative to bbox_diag
+    max_obs_dist_frac: 0.15     # maximum ray/k-NN correspondence distance for observed vertices
+    irls_iterations: 5          # deterministic IRLS iterations (closed-form sparse solve per step)
 
 completion:              # Hoan thien vung bi che lap theo Prompt + Anh Web (Depth-Free, khong can Depth Anything)
   mode: "retrieval_guided"      # retrieval_guided (Visual Hull + Web Ref + Biharmonic) | legacy_heuristic
@@ -125,19 +213,135 @@ completion:              # Hoan thien vung bi che lap theo Prompt + Anh Web (Dep
   use_gsplat_consolidation: false # bat true de tinh chinh da goc nhin bang gsplat 2DGS/3DGS (~2.5 GB VRAM)
   gsplat_iters: 120
 
-mesh_refine:             # Buoc 5: Pipeline tinh chinh & lam min chuyen sau (chay doc lap hoac tu dong)
-  auto_run: true                # tu dong chay ngay sau buoc 4
-  align_upright: true           # bao toan can thang truc va dat sat san Z=0
-  smooth_mode: "taubin"         # taubin (lam min khong lam meo mo tam giac mat day)
-  taubin_iter: 10               # 10 vong Taubin tinh chinh sau Buoc 4
-  taubin_lambda: 0.35
-  taubin_mu: -0.37
-  polish_iter: 2                # 2 vong danh bong tinh che be mat láng nhua
-  polish_iter: 0                # 0: khong mai mon be mat
-  bilateral_normal_iter: 4      # dung khi smooth_mode: bilateral_normal
-  bilateral_vertex_iter: 10
-  bilateral_sigma_s_scale: 1.5
-  bilateral_sigma_r: 0.25
-  bilateral_anchor_weight: 0.08
-  subdivide: false              # bat true neu can tang mat do luoi truoc khi lam min
-  subdivide_method: "midpoint"  # midpoint hoac loop
+mesh_refine:             # Buoc 5: Pipeline tinh chinh, remesh & kiem dinh 6 mat tong quat (.obj/.ply)
+  auto_run: false               # false: tranh chay lap Buoc 5 khi chay --start 1 --until 5
+  align_upright: false          # false: bao toan 100% he toa do, scale va vi tri goc
+  diagnostics:
+    skew_warn_deg: 5.0          # canh bao khi truc chinh PCA/OBB lech > 5 do
+    pca_eigen_ratio_min: 1.15
+    aspect_ratio_bad_thr: 4.0   # nguong tam giac det/rang cua (AR > 4)
+    min_angle_bad_deg: 15.0
+  alignment:
+    align_mode: "preserve"      # preserve | pca_canonical | reference_icp | manhattan
+    normalize_unit_scale: false
+    match_reference_scale: false
+    icp_max_corr_frac: 0.05
+    icp_max_iterations: 40
+    prune_ghost_shells: true    # phat hien & loai vo trung lap lech pha (an toan voi vat rong)
+    overlap_dist_frac: 0.015
+    ghost_overlap_thr: 0.65
+    ghost_normal_align_cos: 0.50
+  cleanup:
+    min_component_tri_ratio: 0.003  # giu moi vat the >= 0.3% tong so tam giac (an toan cho 2+ vat the)
+    min_component_area_ratio: 0.0015 # HOAC >= 0.15% tong dien tich be mat
+    min_component_triangles: 15     # loai bui sieu nho (< 15 tam giac)
+    repair_non_manifold: true
+    orient_consistent: true
+    peel_boundary_sliver_ar: 8.0    # cat tia ria bien qua det (0 de tat)
+    peel_boundary_passes: 2
+    suppress_spikes: true           # khu gai nhon 1-ring MAD
+    spike_sigma_threshold: 3.5
+    spike_edge_mult: 1.5
+    spike_pull_strength: 0.85
+  remesh:
+    enable: true                    # chuan hoa mat do tam giac 6 mat bang PyMeshLab isotropic remeshing
+    target_edge_frac: 0.005         # do dai canh muc tieu = 0.5% duong cheo bbox_diag
+    iterations: 3
+    feature_angle_deg: 32.0         # 32 deg: khoa canh sac vat co khi dong thoi luot muot tren vat cong
+    adaptive: true
+    preserve_uvs: true              # tu dong bo qua remesh neu mesh co UV can giu
+  smoothing:
+    mode: "hybrid"                  # hybrid | taubin | bilateral_normal | none
+    batch_iters: 2                  # micro-batch kiem tra do troi
+    max_batches: 5
+    max_drift_frac: 0.008           # gioi han do troi P95 <= 0.8% duong cheo (can bang khu nhieu & giu form)
+    taubin_lambda: 0.35
+    taubin_mu: -0.37
+    bilateral_sigma_s_scale: 1.5
+    bilateral_sigma_r: 0.28
+    bilateral_anchor_weight: 0.08
+    bilateral_step_size: 0.85
+  audit:
+    enable_report: true             # xuat refine_audit/stage_metrics.json & before_after_6side_audit.png
+    save_intermediates: false       # bat true neu muon luu them stage3_cleaned.obj, stage4a_remeshed.obj
+    render_visuals: true
+    render_dpi: 150
+  subdivide: false
+  subdivide_method: "midpoint"
+
+profiles:                # Ho so ghi de theo loai vat the (goi qua --profile <ten>)
+  curved_object:         # Vat the be mat cong / cong thai hoc (mouse_01, coc, chai, lo)
+    surface_router:
+      mode: "freeform_object"
+    mesh_export:
+      poisson_depth: 7
+      poisson_density_trim_percentile: 0.0
+      mls_iter: 2
+      mls_polynomial_order: 2
+      mls_alpha: 0.85
+      normal_smooth_iter: 3
+      smooth_iter: 15
+      polish_iter: 0
+      remove_table_plane: false
+    mesh_refine:
+      remesh:
+        enable: true
+        target_edge_frac: 0.006
+        iterations: 3
+        feature_angle_deg: 35.0
+        adaptive: true
+      smoothing:
+        mode: "taubin"
+        batch_iters: 2
+        max_batches: 8
+        max_drift_frac: 0.012
+        taubin_lambda: 0.35
+        taubin_mu: -0.37
+
+  sharp_cad:             # Vat the canh sac / co khi / hinh hop 90 do
+    surface_router:
+      mode: "architectural_planar"
+    mesh_export:
+      mesh_mode: "obb"          # hinh hop chu nhat CAD phang sac net, 90 do, 100% watertight
+      prefer_cad_box: true
+      remove_table_plane: true
+      plane_inlier_ratio_range: [0.20, 0.70]
+      plane_one_sided_min_ratio: 0.75
+      plane_orbit_min_cos: 0.60
+      table_clearance_frac: 0.006
+    mesh_refine:
+      remesh:
+        enable: false           # giu nguyen 6 mat phang hoan hao cua hinh hop
+      smoothing:
+        mode: "bilateral_normal"
+        batch_iters: 2
+        max_batches: 2
+        max_drift_frac: 0.002
+        bilateral_sigma_s_scale: 1.5
+        bilateral_sigma_r: 0.22
+        bilateral_anchor_weight: 0.10
+
+  topdown_ergonomic:     # Ep khuon Superquadric + Truong do lech dan hoi (Section 4)
+    surface_router:
+      mode: "topdown_object"
+    topdown_residual:
+      enable: true
+      prior_type: "superquadric"
+
+  scene_multi:           # Canh da vat the / khong gian lon
+    mesh_refine:
+      alignment:
+        align_mode: "preserve"
+        prune_ghost_shells: true
+      cleanup:
+        min_component_tri_ratio: 0.001
+        min_component_area_ratio: 0.0005
+        min_component_triangles: 10
+        peel_boundary_sliver_ar: 0.0
+      remesh:
+        enable: false
+      smoothing:
+        mode: "bilateral_normal"
+        batch_iters: 2
+        max_batches: 3
+        max_drift_frac: 0.002

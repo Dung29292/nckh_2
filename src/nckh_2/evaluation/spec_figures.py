@@ -5,6 +5,7 @@
 - Hinh 5: Kiem dinh ky thuat da goc nhin (Blender Shaded 3D, Top-Down Oblique, Top Lid XY, Front XZ).
 """
 from __future__ import annotations
+
 from pathlib import Path
 import numpy as np
 import open3d as o3d
@@ -63,10 +64,9 @@ def export_all_specification_figures(
     ax2_4.set_aspect("equal")
 
     plt.tight_layout()
-    fig2.savefig(str(out_dir / "hinh2_thong_so_point_cloud_4views.png"), dpi=160)
     fig2.savefig(str(out_dir / "figure2_point_cloud_ortho_4views.png"), dpi=160)
     plt.close(fig2)
-    print("  -> Da luu Hinh 2: hinh2_thong_so_point_cloud_4views.png")
+    print("  -> Saved Figure 2: figure2_point_cloud_ortho_4views.png")
 
     # -------------------------------------------------------------------------
     # HINH 3: KICH THUOC HINH HOC & 3 HINH CHIEU MESH
@@ -97,10 +97,9 @@ def export_all_specification_figures(
     ax3_4.set_aspect("equal")
 
     plt.tight_layout()
-    fig3.savefig(str(out_dir / "hinh3_thong_so_mesh_geometry.png"), dpi=160)
     fig3.savefig(str(out_dir / "figure3_mesh_geometry_4views.png"), dpi=160)
     plt.close(fig3)
-    print("  -> Da luu Hinh 3: hinh3_thong_so_mesh_geometry.png")
+    print("  -> Saved Figure 3: figure3_mesh_geometry_4views.png")
 
     # -------------------------------------------------------------------------
     # HINH 4: PHAN BO DIEM 6 MAT TRUC GIAO
@@ -136,10 +135,9 @@ def export_all_specification_figures(
     axs[1, 2].set_aspect("equal")
 
     plt.tight_layout()
-    fig4.savefig(str(out_dir / "hinh4_thong_so_phan_bo_6mat.png"), dpi=160)
     fig4.savefig(str(out_dir / "figure4_ortho_6faces_analysis.png"), dpi=160)
     plt.close(fig4)
-    print("  -> Da luu Hinh 4: hinh4_thong_so_phan_bo_6mat.png")
+    print("  -> Saved Figure 4: figure4_ortho_6faces_analysis.png")
 
     # -------------------------------------------------------------------------
     # HINH 5: KIEM DINH KY THUAT DA GOC NHIN
@@ -175,7 +173,6 @@ def export_all_specification_figures(
     ax5_4.set_aspect("equal")
 
     plt.tight_layout()
-    fig5.savefig(str(out_dir / "hinh5_kiem_dinh_ky_thuat_shaded.png"), dpi=160)
     fig5.savefig(str(out_dir / "figure5_technical_verification.png"), dpi=160)
     plt.close(fig5)
-    print("  -> Da luu Hinh 5: hinh5_kiem_dinh_ky_thuat_shaded.png")
+    print("  -> Saved Figure 5: figure5_technical_verification.png")

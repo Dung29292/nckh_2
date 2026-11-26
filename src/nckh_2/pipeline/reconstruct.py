@@ -1,19 +1,24 @@
-"""Buoc 3: Pose camera (ArUco hoac COLMAP SfM) + Dense (COLMAP MVS hoac splatfacto) -> point cloud .ply.
+"""Buoc 3: Pose camera (COLMAP SfM) + Dense (COLMAP MVS hoac splatfacto) -> point cloud .ply.
 
 Vao : data/samples/<mau>/frames_sharp/*.jpg, data/samples/<mau>/masks/*.png
 Ra  : data/samples/<mau>/nerfstudio/         (colmap/, transforms.json, images/, masks/)
       outputs/<mau>/point_cloud.ply
 """
+from __future__ import annotations
+
 import json
 import os
-import shutil
-import struct
-import subprocess
 from pathlib import Path
+import shutil
+import subprocess
+from typing import Any
+
 import cv2
 import numpy as np
 
-from . import paths
+from nckh_2.backends.colmap_io import count_colmap_images, read_colmap_sparse_positions
+from nckh_2.core import paths
+from nckh_2.core.types import SceneContext, StageResult
 
 
 def _run(cmd: list[str]) -> None:
@@ -22,7 +27,6 @@ def _run(cmd: list[str]) -> None:
 
 
 def _promote_largest_model(sparse_dir: Path) -> None:
-    """COLMAP co the sinh nhieu model (0, 1, 2...). nerfstudio chi doc sparse/0 -> dua model lon nhat ve 0."""
     def size(d: Path) -> int:
         f = d / "images.bin"
         if not f.exists():
@@ -43,8 +47,7 @@ def _promote_largest_model(sparse_dir: Path) -> None:
             tmp.rename(sparse_dir / best.name)
 
 
-def _finish_process_data(sdir: Path, nf_dir: Path, cfg: dict | None = None) -> Path:
-    """Goi ns-process-data --skip-colmap (doc colmap/sparse/0) -> transforms.json, roi copy anh."""
+def _finish_process_data(sdir: Path, nf_dir: Path, cfg: dict[str, Any] | None = None) -> Path:
     images = sdir / "frames_sharp"
     method = (cfg or {}).get("reconstruction", {}).get("method", "colmap_mvs")
     if method != "colmap_mvs" or shutil.which("ns-process-data"):
@@ -66,8 +69,7 @@ def _finish_process_data(sdir: Path, nf_dir: Path, cfg: dict | None = None) -> P
     return nf_dir
 
 
-def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
-    """Nhanh COLMAP tu do pose bang SfM (turntable: chi trich dac trung trong mask)."""
+def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict[str, Any]) -> Path:
     rc = cfg["reconstruction"]
     use_mask = rc.get("capture_mode", "orbit") == "turntable"
 
@@ -78,13 +80,15 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
 
     peak_thresh = str(rc.get("sift_peak_threshold", 0.001))
     max_features = str(rc.get("sift_max_features", 16384))
+    camera_model = str(rc.get("camera_model", "OPENCV"))
+    single_camera = "1" if bool(rc.get("single_camera", True)) else "0"
 
     extract = [
         "colmap", "feature_extractor",
         "--database_path", str(db),
         "--image_path", str(images),
-        "--ImageReader.single_camera", "1",
-        "--ImageReader.camera_model", "OPENCV",
+        "--ImageReader.single_camera", single_camera,
+        "--ImageReader.camera_model", camera_model,
         "--FeatureExtraction.use_gpu", "1",
         "--SiftExtraction.peak_threshold", peak_thresh,
         "--SiftExtraction.max_num_features", max_features,
@@ -97,9 +101,12 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         extract += ["--ImageReader.mask_path", str(mask_dir)]
     _run(extract)
 
-    # Chay sequential matcher de lien ket cac frame lien tiep theo thoi gian
     overlap = str(rc.get("sequential_overlap", 20))
-    min_inliers = str(rc.get("matching_min_inliers", 8))
+    min_inliers = str(rc.get("matching_min_inliers", 12))
+    loop_det = bool(rc.get("loop_detection", True))
+    loop_period = str(rc.get("loop_detection_period", 10))
+    vocab_tree = str(rc.get("vocab_tree_path", "") or "").strip()
+
     seq_cmd = [
         "colmap", "sequential_matcher",
         "--database_path", str(db),
@@ -109,17 +116,24 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         "--SequentialMatching.quadratic_overlap", "1",
         "--TwoViewGeometry.min_num_inliers", min_inliers,
     ]
+    if loop_det and vocab_tree and Path(vocab_tree).exists():
+        seq_cmd += [
+            "--SequentialMatching.loop_detection", "1",
+            "--SequentialMatching.loop_detection_period", loop_period,
+            "--SequentialMatching.vocab_tree_path", vocab_tree,
+        ]
     _run(seq_cmd)
 
-    # Chay exhaustive matcher de ket noi them cac frame doi dien & cheo goc
-    exh_cmd = [
-        "colmap", "exhaustive_matcher",
-        "--database_path", str(db),
-        "--FeatureMatching.use_gpu", "1",
-        "--FeatureMatching.guided_matching", "1",
-        "--TwoViewGeometry.min_num_inliers", min_inliers,
-    ]
-    _run(exh_cmd)
+    # Mandatory offline loop closure: exhaustive all-pairs matching guarantees final 20% <-> initial 20% closure
+    if loop_det or str(rc.get("matching_method", "exhaustive")).lower() == "exhaustive":
+        exh_cmd = [
+            "colmap", "exhaustive_matcher",
+            "--database_path", str(db),
+            "--FeatureMatching.use_gpu", "1",
+            "--FeatureMatching.guided_matching", "1",
+            "--TwoViewGeometry.min_num_inliers", min_inliers,
+        ]
+        _run(exh_cmd)
 
     _run([
         "colmap", "mapper",
@@ -127,72 +141,20 @@ def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict) -> Path:
         "--image_path", str(images),
         "--output_path", str(colmap_dir / "sparse"),
         "--Mapper.min_num_matches", str(rc.get("mapper_min_num_matches", 8)),
-        "--Mapper.init_min_num_inliers", str(rc.get("mapper_init_min_inliers", 20)),
-        "--Mapper.abs_pose_min_num_inliers", str(rc.get("mapper_abs_pose_min_inliers", 8)),
+        "--Mapper.init_min_num_inliers", str(rc.get("mapper_init_min_num_inliers", 20)),
+        "--Mapper.abs_pose_min_num_inliers", str(rc.get("mapper_abs_pose_min_num_inliers", 8)),
         "--Mapper.filter_max_reproj_error", str(rc.get("mapper_filter_max_reproj_error", 6.0)),
         "--Mapper.tri_ignore_two_view_tracks", "0",
     ])
     _promote_largest_model(colmap_dir / "sparse")
     return _finish_process_data(sdir, nf_dir, cfg)
 
-def _process_data(sdir: Path, cfg: dict) -> Path:
-    rc = cfg["reconstruction"]
+
+def _process_data(sdir: Path, cfg: dict[str, Any]) -> Path:
     nf_dir = sdir / "nerfstudio"
     if nf_dir.exists():
         shutil.rmtree(nf_dir)
-
-    pose_method = rc.get("pose_method", "colmap")  # default colmap
-
-    return _process_data_colmap_sfm(sdir, nf_dir, cfg)  # tên hàm COLMAP của bạn
-
-
-def _read_colmap_sparse_positions(sparse_0: Path) -> list[np.ndarray]:
-    """Doc toa do tam camera 3D truc tiep tu colmap/sparse/0/images.bin."""
-    bin_file = sparse_0 / "images.bin"
-    positions: list[np.ndarray] = []
-    if bin_file.exists():
-        try:
-            with open(bin_file, "rb") as f:
-                num_images = int(struct.unpack("<Q", f.read(8))[0])
-                for _ in range(num_images):
-                    _image_id = struct.unpack("<i", f.read(4))[0]
-                    qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
-                    tx, ty, tz = struct.unpack("<3d", f.read(24))
-                    _camera_id = struct.unpack("<i", f.read(4))[0]
-                    while True:
-                        c = f.read(1)
-                        if not c or c == b"\x00":
-                            break
-                    num_pts2d = struct.unpack("<Q", f.read(8))[0]
-                    f.seek(num_pts2d * 24, 1)
-                    R = np.array([
-                        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-                        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
-                        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
-                    ])
-                    t = np.array([tx, ty, tz])
-                    positions.append(-R.T @ t)
-        except Exception:
-            pass
-    return positions
-
-
-def _count_colmap_images(sparse_0: Path) -> int:
-    bin_file = sparse_0 / "images.bin"
-    if bin_file.exists():
-        try:
-            with open(bin_file, "rb") as f:
-                return int(struct.unpack("<Q", f.read(8))[0])
-        except Exception:
-            pass
-    txt_file = sparse_0 / "images.txt"
-    if txt_file.exists():
-        try:
-            lines = [l for l in txt_file.read_text(encoding="utf-8").splitlines() if l and not l.startswith("#")]
-            return len(lines) // 2
-        except Exception:
-            pass
-    return 0
+    return _process_data_colmap_sfm(sdir, nf_dir, cfg)
 
 
 def _check_poses(nf_dir: Path, sdir: Path, min_ratio: float, warn_collapse: bool = True) -> None:
@@ -209,10 +171,9 @@ def _check_poses(nf_dir: Path, sdir: Path, min_ratio: float, warn_collapse: bool
             if m.shape == (4, 4):
                 positions.append(m[:3, 3])
     else:
-        # Neu transforms.json chua co (vi du mode colmap_mvs), doc truc tiep tu colmap sparse model
         sparse_0 = nf_dir / "colmap" / "sparse" / "0"
-        n_pose = _count_colmap_images(sparse_0)
-        positions = _read_colmap_sparse_positions(sparse_0)
+        n_pose = count_colmap_images(sparse_0)
+        positions = read_colmap_sparse_positions(sparse_0)
 
     print(f"[Buoc 3] Dinh vi duoc {n_pose}/{n_all} anh")
     if n_pose / max(n_all, 1) < min_ratio:
@@ -221,7 +182,6 @@ def _check_poses(nf_dir: Path, sdir: Path, min_ratio: float, warn_collapse: bool
             "Dung lai: khong du du lieu de dung dense."
         )
 
-    # Phan tich quy dao camera de phat hien Pose Collapse (gay ra hien tuong song bien)
     if warn_collapse and len(positions) >= 5:
         pos_arr = np.array(positions)
         center = pos_arr.mean(axis=0)
@@ -245,10 +205,6 @@ def _check_poses(nf_dir: Path, sdir: Path, min_ratio: float, warn_collapse: bool
             print(f"  - Do bien thien ban kinh rat lon ({r_var:.0%}), camera bi keo lech.")
             print("  => Voi vat the tron xoay/it texture (lo, coc, chai), cac camera de bi ket")
             print("     vao 1 cung hep va chong cheo thanh nhieu lop vo (song bien).")
-            print("  => Giai phap:")
-            print("     1. Dat vat the len de co hoa van tren ban xoay (bat base_pad_bottom_frac).")
-            print("     2. Dan 2-3 mieng sticker/bang keo danh dau khac nhau quanh than vat the.")
-            print("     3. Thu matching_method: sequential trong configs/default.yaml.")
             print("=" * 70 + "\n")
 
 
@@ -305,7 +261,7 @@ def _export_pointcloud(config_yml: Path, sample_name: str) -> Path:
     return out_ply
 
 
-def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
+def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict[str, Any]) -> Path:
     rc = cfg["reconstruction"]
     dense = nf_dir / "dense"
     if dense.exists():
@@ -329,8 +285,6 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
             "--PatchMatchStereo.geom_consistency", "true" if geom else "false",
         ])
     except subprocess.CalledProcessError as err:
-        # Tren Windows, CUDA DLL doi khi tra ve ma loi (nhu 3221226505) khi giai phong bo nho o cuoi lenh
-        # Neu da ghi duoc depth maps thi coi nhu thanh cong va tiep tuc
         depth_maps = list((dense / "stereo" / "depth_maps").glob("*.photometric.bin"))
         if len(depth_maps) > 0:
             print(f"  [COLMAP MVS] Da tao {len(depth_maps)} depth maps (bo qua ma loi exit {err.returncode})")
@@ -377,7 +331,7 @@ def _dense_mvs(sdir: Path, nf_dir: Path, sample_name: str, cfg: dict) -> Path:
     return out_ply
 
 
-def run(sample_name: str, cfg: dict) -> None:
+def run(sample_name: str, cfg: dict[str, Any]) -> None:
     os.environ["MAX_JOBS"] = "1"
     os.environ["NINJA_FLAGS"] = "-j1"
     sdir = paths.sample_dir(sample_name)
@@ -404,3 +358,13 @@ def run(sample_name: str, cfg: dict) -> None:
         print("[Buoc 3] Xuat point cloud...")
         out_ply = _export_pointcloud(config_yml, sample_name)
     print(f"[Buoc 3] Xong -> {out_ply}")
+
+
+class ReconstructStage:
+    stage_id = 3
+    title = "COLMAP + 3DGS"
+
+    def execute(self, ctx: SceneContext) -> StageResult:
+        run(ctx.sample_name, ctx.config)
+        ctx.artifacts["point_cloud"] = ctx.output_dir / "point_cloud.ply"
+        return StageResult(stage_id=self.stage_id, stage_name=self.title, success=True, artifacts=ctx.artifacts)

@@ -46,6 +46,7 @@ psutil = ">=5.9.0"
 
 [tool.poetry.scripts]
 nckh = "nckh_2.main:main"
+nckh-patch-colmap = "nckh_2.backends.colmap_patch:patch_nerfstudio_colmap_utils"
 
 [[tool.poetry.source]]
 name = "pytorch-cu121"

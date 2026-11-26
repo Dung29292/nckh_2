@@ -1,13 +1,14 @@
 """Retrieval-augmented, text-guided depth-free 3D completion package for nckh_2."""
+from __future__ import annotations
 
-from .detail_smooth import (
+from nckh_2.backends.smoothing import (
     bilateral_normal_smooth,
     compute_discrete_curvature,
     interpolate_point_confidence_to_mesh,
     pymeshlab_two_step_smooth,
     transfer_observed_detail_residuals,
 )
-from .evaluate import (
+from nckh_2.evaluation.metrics import (
     DetailRetentionMetrics,
     SurfaceMetrics,
     build_synthetic_detailed_box,
@@ -15,9 +16,9 @@ from .evaluate import (
     evaluate_detail_preservation,
     evaluate_reconstruction_split,
 )
-from .inpaint_fuse import CompletionResult, run_depth_free_completion
-from .prior_parser import StructuralPrior, parse_structural_prior
-from .visibility import (
+from nckh_2.pipeline.completion.inpaint_fuse import CompletionResult, run_depth_free_completion
+from nckh_2.pipeline.completion.prior_parser import StructuralPrior, parse_structural_prior
+from nckh_2.pipeline.completion.visibility import (
     CalibratedView,
     VirtualViewRender,
     VisualHull,
@@ -27,7 +28,7 @@ from .visibility import (
     seed_symmetry_points,
     solve_biharmonic_depth_proxy,
 )
-from .web_retriever import VerifiedReference, retrieve_and_verify_references
+from nckh_2.pipeline.completion.web_retriever import VerifiedReference, retrieve_and_verify_references
 
 __all__ = [
     "CalibratedView",

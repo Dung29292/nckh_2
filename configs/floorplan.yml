@@ -1,0 +1,92 @@
+# =============================================================================
+# configs/floorplan.yml
+# Unified Configuration for Architectural Scan-to-CAD / Scan-to-BIM & M5 Rooms
+# Strictly externalizes all tolerances, resolutions, and kernels (Zero Magic Numbers)
+# =============================================================================
+
+domain:
+  mode: "auto"                        # auto | architectural_planar | room_layout | freeform_object
+  metric_units: true                  # true when input point cloud is metric (meters)
+
+numerical:
+  norm_eps: 1.0e-12                   # minimum vector norm guard before normalization
+  collinear_cross_eps: 1.0e-8         # minimum |(P2-P1) x (P3-P1)| for 3-point plane seeding
+  svd_reg_eps: 1.0e-8                 # Tikhonov regularization for ill-conditioned local fits
+  corner_det_eps: 1.0e-9              # determinant guard for 2D analytical line intersection
+
+hessian_plane:                        # Section 2.1 - Eq. (1) & Eq. (2): ax + by + cz + d = 0
+  horizontal_min_abs_nz: 0.9659258    # cos(15 deg): |nz| >= threshold -> horizontal plane
+  vertical_max_abs_nz: 0.2588190      # sin(15 deg): |nz| <= threshold -> vertical wall
+  floor_max_height_quantile: 0.15     # horizontal plane near bottom 15% of room Z-span -> floor slab
+  ceiling_min_height_quantile: 0.85   # horizontal plane near top 85% of room Z-span -> ceiling slab
+  floor_ceiling_split_quantile: 0.50  # fallback split when only floor+ceiling slabs are present
+  canonical_sign: true                # canonicalize sign of (n, d) so d <= 0 when unambiguous
+
+quadrics:                             # Section 2.2 - Eq. (3), Eq. (4) Cylinder, Eq. (5) Sphere
+  enable_column_detection: true
+  enable_sphere_detection: true
+  eps_cylinder_m: 0.015               # Eq. (4): |d(P, axis) - r| < eps_cylinder (1.5 cm)
+  eps_sphere_m: 0.020                 # Eq. (5): ||P - C|| - R < eps_sphere (2.0 cm)
+  cylinder_radius_range_m: [0.08, 1.50]
+  sphere_radius_range_m: [0.20, 10.00]
+  ransac_iterations: 1200
+  min_inliers: 120
+  normal_axis_ortho_max_cos: 0.20     # |n_P . a| <= sin(~11.5 deg) for cylinder surface normals
+  vertical_column_min_abs_az: 0.94    # cos(~20 deg) when constraining architectural columns vertical
+  gn_max_iterations: 25               # Gauss-Newton global refit iterations over all inliers
+  gn_tol: 1.0e-7
+
+adaptive_ransac:                      # Section 3.1 - Iterative RANSAC + Dual Validation + SVD Refit
+  eps_plane_m: 0.020                  # Filter 1: orthogonal point-to-plane tolerance (2 cm)
+  normal_max_angle_deg: 15.0          # Filter 2 - Eq. (10): theta < 15 deg (|n_plane . n_Q| > cos(theta))
+  max_planes: 24                      # maximum structural planes extracted sequentially
+  ransac_iterations: 1500             # trials per plane hypothesis
+  confidence: 0.99                    # adaptive stopping confidence p
+  min_inliers: 150                    # minimum dual-validated consensus points to accept a plane
+  min_remaining_points: 100           # stop sequential extraction below this remainder count
+  local_seed_radius_m: 0.80           # spatial neighborhood radius for minimal 3-point seeding
+  discard_seed_on_refit: true         # strictly discard the 3 minimal seed points before global SVD refit
+  normal_estimation_radius_m: 0.10    # k-NN radius if input point cloud lacks precomputed normals
+  normal_estimation_max_nn: 30
+  deterministic_seed: 42              # RNG seed for reproducible RANSAC sampling
+
+clutter_recovery:                     # Section 3.2 - RandLA-Net Clutter Reclamation & Gap Closing
+  enable_reclamation: true
+  clutter_semantic_labels: [0, 12, 13] # semantic IDs treated as clutter/furniture (e.g., S3DIS/RandLA-Net)
+  reclaim_eps_plane_m: 0.020          # orthogonal tolerance to wall plane for clutter reclamation
+  reclaim_max_angle_deg: 15.0         # normal compatibility angle for reclaimed wall points
+  vertical_margin_m: 0.05             # z-band margin [z_floor - margin, z_ceil + margin]
+  morphological_closing:
+    enable: true
+    grid_resolution_m: 0.025          # 2D wall occupancy projection grid step (2.5 cm/cell)
+    kernel_width_m: 0.85              # horizontal closing span bridging occluding desks/cabinets
+    kernel_height_m: 0.95             # vertical closing span bridging skirting/plinth occlusions
+
+manhattan_alignment:                  # Section 3.3 - Eq. (11) & Rectilinear 90-deg Regularization
+  enable: true
+  use_fourfold_circular_mean: true    # exact modulo-(pi/2) circular mean avoiding 0 / 90 deg wrap bias
+  histogram_bins: 180                 # angular histogram resolution on [0, pi/2)
+  snap_non_manhattan_max_deg: 15.0    # preserve true diagonal walls if > 15 deg from Manhattan axes
+  min_wall_segment_length_m: 0.25     # minimum 2D wall segment length retained in floorplan
+  merge_collinear_offset_m: 0.06      # merge split co-planar wall segments within offset tolerance
+
+topdown_room:                         # Section 4 - Top-Down RoomFormer Polygon + Local Residual RANSAC
+  enable: true
+  occupancy_grid_res_m: 0.04          # BEV density map resolution for closed-form Manhattan prior
+  wall_density_quantile: 0.85         # high-density vertical projection threshold
+  corridor_halfwidth_m: 0.15          # local RANSAC search band (+/- 15 cm) around canonical wall edge
+  lambda_smooth: 0.25                 # Eq. (16) regularization weight anchoring residual shifts to prior
+  default_wall_thickness_m: 0.15      # BIM wall extrusion thickness when single-face scanned
+  default_slab_thickness_m: 0.20      # BIM floor/ceiling slab thickness
+  fallback_room_height_m: 2.80        # fallback height when ceiling plane is unobserved
+
+cad_bim_export:                       # Section 5 - 2D CAD (.dxf) & 3D BIM (.ifc) Output Parameters
+  export_dxf: true
+  export_ifc: true
+  dxf_Wall_layer: "A-WALL"
+  dxf_column_layer: "A-COLS"
+  dxf_slab_layer: "A-SLAB"
+  ifc_schema: "IFC4"
+  ifc_project_name: "NCKH2_ScanToBIM"
+  polygon_closure_tol_m: 1.0e-6
+  corner_orthogonality_tol_deg: 0.05

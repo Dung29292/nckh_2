@@ -1,266 +1,37 @@
-"""Nguon dau vao: (1) quay video truc tiep -> luu thanh mau moi, hoac (2) chon mau co san."""
-import collections
+"""Vong lap giao dien OpenCV ghi video tu USB / Mobile Camera."""
+from __future__ import annotations
+
 import json
-import queue
-import threading
-import time
-from datetime import datetime
 from pathlib import Path
+import time
+from typing import Any
 
 import cv2
 import numpy as np
 
-from . import paths
+from nckh_2.core import paths
+from nckh_2.core.types import SampleMetadata
+from nckh_2.capture.camera_io import (
+    AsyncVideoWriter,
+    finalize_recorded_video,
+    is_mobile_cap,
+    is_mobile_source,
+    open_camera,
+    read_cam_props,
+)
+from nckh_2.capture.sample_store import unique_name
 
 
-# ---------------------------------------------------------------- mau co san
-def list_samples(video_file: str) -> list[str]:
-    if not paths.SAMPLES_DIR.exists():
-        return []
-    return sorted(
-        d.name for d in paths.SAMPLES_DIR.iterdir() if d.is_dir() and (d / video_file).exists()
-    )
-
-
-def choose_sample(video_file: str) -> str | None:
-    """Hien danh sach mau va cho nguoi dung chon bang so."""
-    samples = list_samples(video_file)
-    if not samples:
-        print(f"Chua co mau nao. Hay dat video vao data/samples/<ten_mau>/{video_file} hoac chon che do quay.")
-        return None
-    print("\nCac mau co san:")
-    for i, name in enumerate(samples, 1):
-        print(f"  [{i}] {name}")
-    while True:
-        s = input("Chon mau (so, Enter de huy): ").strip()
-        if not s:
-            return None
-        if s.isdigit() and 1 <= int(s) <= len(samples):
-            return samples[int(s) - 1]
-        print("Lua chon khong hop le.")
-
-
-class LiveCameraReader:
-    """Doc camera USB tren mot background thread rieng biet.
-    Triet tieu 100% do tre tich luy trong DirectShow driver buffer tren Windows
-    va cung cap hang doi ghi khong mat frame khi quay."""
-    def __init__(self, raw_cap):
-        self.raw_cap = raw_cap
-        self._latest_frame: np.ndarray | None = None
-        self._record_queue: collections.deque[np.ndarray] = collections.deque(maxlen=1200)
-        self._recording = False
-        self._running = True
-        self._lock = threading.Lock()
-        # Doc truoc frame dau tien de co san latest_frame ngay lap tuc
-        try:
-            ok, frame = self.raw_cap.read()
-            if ok and frame is not None:
-                self._latest_frame = frame
-        except Exception:
-            pass
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self) -> None:
-        while self._running and self.raw_cap.isOpened():
-            ok, frame = self.raw_cap.read()
-            if not ok or frame is None:
-                time.sleep(0.005)
-                continue
-            with self._lock:
-                self._latest_frame = frame
-                if self._recording:
-                    self._record_queue.append(frame)
-
-    def get_live_preview(self) -> np.ndarray | None:
-        """Lay frame moi nhat tuc thoi (Zero Latency) de hien thi tren Desktop."""
-        with self._lock:
-            return self._latest_frame
-
-    def pop_recorded_frames(self) -> list[np.ndarray]:
-        """Rut toan bo frame da thu nhap vao hang doi de ghi vao file video."""
-        with self._lock:
-            if not self._record_queue:
-                return []
-            frames = list(self._record_queue)
-            self._record_queue.clear()
-            return frames
-
-    def set_recording_state(self, recording: bool) -> None:
-        with self._lock:
-            self._recording = bool(recording)
-            if self._recording:
-                self._record_queue.clear()
-
-    def isOpened(self) -> bool:
-        return self._running and self.raw_cap.isOpened()
-
-    def get(self, prop_id: int) -> float:
-        return float(self.raw_cap.get(prop_id))
-
-    def set(self, prop_id: int, value: float) -> bool:
-        return bool(self.raw_cap.set(prop_id, value))
-
-    def release(self) -> None:
-        self._running = False
-        if self._thread.is_alive():
-            self._thread.join(timeout=0.5)
-        self.raw_cap.release()
-
-
-class AsyncVideoWriter:
-    """Ghi video bat dong bo ra o dia bang Worker Thread rieng biet.
-    Khong bao gio lam cham giao dien Desktop va khong bao gio drop frame."""
-    def __init__(self, filepath: str, fourcc: int, fps: float, size: tuple[int, int]):
-        self.writer = cv2.VideoWriter(filepath, fourcc, fps, size)
-        self.queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1500)
-        self.stopped = False
-        self.written_frames = 0
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def write(self, frame: np.ndarray) -> None:
-        if not self.stopped:
-            try:
-                self.queue.put_nowait(frame)
-            except queue.Full:
-                pass
-
-    def _worker(self) -> None:
-        while not self.stopped or not self.queue.empty():
-            try:
-                frame = self.queue.get(timeout=0.05)
-                self.writer.write(frame)
-                self.written_frames += 1
-                self.queue.task_done()
-            except queue.Empty:
-                continue
-
-    def release(self) -> int:
-        self.stopped = True
-        if self.thread.is_alive():
-            self.thread.join(timeout=8.0)
-        self.writer.release()
-        return self.written_frames
-
-
-# ---------------------------------------------------------------- quay video
-def _is_mobile_source(camera) -> bool:
-    return isinstance(camera, str) and camera.strip().lower() in ("mobile", "phone", "qr")
-
-
-def _is_mobile_cap(cap) -> bool:
-    return getattr(cap, "is_mobile", False) or cap.__class__.__name__ == "MobileVideoCapture"
-
-
-def _open_camera(camera, width: int, height: int, fps: int, rec_cfg: dict | None = None):
-    if _is_mobile_source(camera):
-        try:
-            from .mobile_camera import MobileVideoCapture
-        except ImportError as exc:
-            print(f"Khong the mo Camera dien thoai do thieu thu vien ({exc}).")
-            print("Goi y: chay 'poetry install' hoac 'pip install flask simple-websocket cryptography psutil' de dung tinh nang nay.")
-            return cv2.VideoCapture()
-        rec_cfg = rec_cfg or {}
-        return MobileVideoCapture(
-            width=width,
-            height=height,
-            fps=fps,
-            port=int(rec_cfg.get("mobile_port", 8443)),
-            host_ip=rec_cfg.get("mobile_host_ip") or None,
-            use_ssl=bool(rec_cfg.get("mobile_ssl", True)),
-        )
-
-    if isinstance(camera, str) and camera.isdigit():
-        camera = int(camera)
-    # CAP_DSHOW on dinh nhat tren Windows
-    raw_cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW) if isinstance(camera, int) else cv2.VideoCapture(camera)
-    if not raw_cap.isOpened() and isinstance(camera, int):
-        raw_cap = cv2.VideoCapture(camera)
-
-    # TRIET TIEU DO TRE (ZERO LATENCY):
-    # 1. Ep FourCC MJPG truoc de camera USB truyen nen phan cung (dat 30-60 FPS)
-    if isinstance(camera, int):
-        raw_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        raw_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        raw_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        raw_cap.set(cv2.CAP_PROP_FPS, fps)
-        raw_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not raw_cap.isOpened():
-        return raw_cap
-    return LiveCameraReader(raw_cap)
-
-
-def _read_cam_props(cap, default_fps: float) -> tuple[int, int, float]:
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or default_fps
-    if fps < 1 or fps > 120:
-        fps = default_fps
-    return w, h, fps
-
-
-def _finalize_recorded_video(
-    temp_video_path: Path,
-    video_path: Path,
-    recorded_frames: int,
-    elapsed: float,
-    nominal_fps: float,
-    size: tuple[int, int],
-) -> float:
-    """Dong bo lai FPS thuc te neu do tre lam lech thoi luong video."""
-    actual_fps = recorded_frames / elapsed if elapsed > 0 and recorded_frames > 0 else nominal_fps
-    print(f"Da dung quay: {recorded_frames} khung hinh trong {elapsed:.1f}s -> FPS thuc te: {actual_fps:.2f}")
-    if abs(actual_fps - nominal_fps) > 1.5 and actual_fps >= 1.0 and temp_video_path.exists():
-        print(f"Dong bo lai video theo FPS thuc te ({actual_fps:.2f} FPS) de khong bi tua nhanh...")
-        rcap = cv2.VideoCapture(str(temp_video_path))
-        rwriter = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), actual_fps, size)
-        while True:
-            rok, rframe = rcap.read()
-            if not rok:
-                break
-            rwriter.write(rframe)
-        rcap.release()
-        rwriter.release()
-        try:
-            temp_video_path.unlink()
-        except Exception:
-            pass
-    elif temp_video_path.exists():
-        if video_path.exists():
-            video_path.unlink()
-        temp_video_path.rename(video_path)
-    return actual_fps
-
-
-def _unique_name(name: str | None) -> str:
-    if not name:
-        return "box_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    base, n = name, 1
-    while paths.sample_dir(name).exists():
-        n += 1
-        name = f"{base}_{n}"
-    return name
-
-
-def record_video(name: str | None, cfg: dict) -> str | None:
-    """Quay tu camera (Webcam USB hoac Camera dien thoai qua QR/Wi-Fi). Phim:
-      - R: bat dau / dung quay
-      - M: chuyen sang Camera dien thoai (quet QR)
-      - C hoac 0, 1, 2, 3: doi camera truc tiep tren man hinh
-      - P: doi 1080p / 720p
-      - Q hoac ESC: thoat
-    Tra ve ten mau da luu.
-    """
+def record_video(name: str | None, cfg: dict[str, Any]) -> str | None:
+    """Quay video tu camera (Webcam USB hoac Mobile Camera qua QR/Wi-Fi)."""
     rec = cfg["record"]
     current_cam = rec["camera"]
-    cap = _open_camera(current_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
-    if not cap.isOpened() and not _is_mobile_source(current_cam):
+    cap = open_camera(current_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
+    if not cap.isOpened() and not is_mobile_source(current_cam):
         print(f"Khong mo duoc camera {current_cam}. Thu doi sang camera khac...")
         for fb_cam in [0, 1, 2]:
             if fb_cam != current_cam:
-                cap = _open_camera(fb_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
+                cap = open_camera(fb_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
                 if cap.isOpened():
                     current_cam = fb_cam
                     print(f"Da tu dong chuyen sang Camera {current_cam}.")
@@ -269,9 +40,9 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         print("Khong tim thay camera nao kha dung. Kiem tra record.camera hoac thu --camera mobile.")
         return None
 
-    w, h, fps = _read_cam_props(cap, rec["fps"])
+    w, h, fps = read_cam_props(cap, rec["fps"])
 
-    name = _unique_name(name)
+    name = unique_name(name)
     sdir = paths.sample_dir(name)
     video_path = sdir / cfg["video_file"]
 
@@ -281,8 +52,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
     actual_fps = fps
     last_mobile_frame = None
 
-    # Bo nho dem giu phien Mobile Camera song lien tuc (khong mat ket noi khi doi qua lai USB Cam)
-    mobile_cap = cap if _is_mobile_cap(cap) else None
+    mobile_cap = cap if is_mobile_cap(cap) else None
 
     win_name = "nckh_2 - record"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -307,7 +77,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
     cv2.setMouseCallback(win_name, _on_mouse)
 
     def _print_banner() -> None:
-        if _is_mobile_cap(cap):
+        if is_mobile_cap(cap):
             cap.print_connection_info()
         else:
             print(f"Camera [{current_cam}] {w}x{h} @ {fps:.0f}fps.")
@@ -316,7 +86,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
     def _disconnect_mobile() -> None:
         nonlocal mobile_cap, cap, current_cam, w, h, fps
-        if mobile_cap is not None or _is_mobile_cap(cap):
+        if mobile_cap is not None or is_mobile_cap(cap):
             print("\nDa chu dong ngat ket noi Camera dien thoai.")
             if mobile_cap is not None:
                 try:
@@ -324,7 +94,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 except Exception:
                     pass
                 mobile_cap = None
-            if _is_mobile_cap(cap):
+            if is_mobile_cap(cap):
                 try:
                     cap.release()
                 except Exception:
@@ -335,10 +105,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             else:
                 _print_banner()
 
-    def _switch_source(target_cam) -> None:
+    def _switch_source(target_cam: Any) -> None:
         nonlocal cap, current_cam, w, h, fps, last_mobile_frame, mobile_cap
-        target_is_mobile = _is_mobile_source(target_cam)
-        cur_is_mobile = _is_mobile_cap(cap)
+        target_is_mobile = is_mobile_source(target_cam)
+        cur_is_mobile = is_mobile_cap(cap)
 
         if target_is_mobile:
             if cur_is_mobile:
@@ -349,35 +119,33 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 print("Chuyen sang Camera dien thoai (tai su dung phien ket noi da co, khong can quet lai QR)...")
                 cap = mobile_cap
                 current_cam = "mobile"
-                w, h, fps = _read_cam_props(cap, rec["fps"])
+                w, h, fps = read_cam_props(cap, rec["fps"])
                 _print_banner()
                 return
 
             print("Khoi dong ket noi Camera dien thoai qua QR...")
-            new_cap = _open_camera("mobile", rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
+            new_cap = open_camera("mobile", rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
             if new_cap.isOpened():
                 mobile_cap = new_cap
                 cap = new_cap
                 current_cam = "mobile"
                 last_mobile_frame = None
-                w, h, fps = _read_cam_props(cap, rec["fps"])
+                w, h, fps = read_cam_props(cap, rec["fps"])
                 _print_banner()
             return
 
-        # Chuyen sang USB Cam (0, 1, 2...)
         if cur_is_mobile:
-            # GIU NGUYEN phien mobile_cap chay ngam, khong release de dien thoai giu WebSocket!
             mobile_cap = cap
         elif cap is not None:
             cap.release()
 
         print(f"Dang chuyen sang Camera [{target_cam}]...")
         time.sleep(0.15)
-        new_cap = _open_camera(target_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
+        new_cap = open_camera(target_cam, rec["width"], rec["height"], rec["fps"], rec_cfg=rec)
         if new_cap.isOpened():
             cap = new_cap
             current_cam = target_cam
-            w, h, fps = _read_cam_props(cap, rec["fps"])
+            w, h, fps = read_cam_props(cap, rec["fps"])
             _print_banner()
         else:
             print(f"-> Camera [{target_cam}] khong kha dung. Khoi phuc lai Camera [{current_cam}]...")
@@ -385,26 +153,18 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 cap = mobile_cap
                 current_cam = "mobile"
             else:
-                cap = _open_camera(current_cam, w, h, rec["fps"], rec_cfg=rec)
+                cap = open_camera(current_cam, w, h, rec["fps"], rec_cfg=rec)
 
     _print_banner()
 
     while True:
-        # Kiem tra dong cua so qua nut 'X'
         if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
         loop_idx += 1
-        is_mobile = _is_mobile_cap(cap)
-        if is_mobile:
-            if cap.pop_command() == "toggle_record":
-                key_trigger_record = True
-            else:
-                key_trigger_record = False
-        else:
-            key_trigger_record = False
+        is_mob = is_mobile_cap(cap)
+        key_trigger_record = (cap.pop_command() == "toggle_record") if is_mob else False
 
-        # 1. Ghi cac frame moi nhat vao VideoWriter ngam (Lossless Frame Queue)
         if writer is not None:
             new_frames = cap.pop_recorded_frames()
             for nf in new_frames:
@@ -414,10 +174,9 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 writer.write(write_frame)
                 recorded_frames += 1
 
-        # 2. Lay frame moi nhat tuc thoi (Zero Latency) de hien thi tren Desktop
         live_frame = cap.get_live_preview()
         if live_frame is None:
-            if is_mobile and not cap.has_frame:
+            if is_mob and not cap.has_frame:
                 raw_display = cap.get_qr_card()
                 frame_ready = False
             elif last_mobile_frame is not None:
@@ -436,7 +195,6 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             if writer is None and (fw != w or fh != h):
                 w, h = fw, fh
 
-        # --- LETTERBOXING & PRO HUD RENDERING ---
         if loop_idx % 20 == 0:
             try:
                 r = cv2.getWindowImageRect(win_name)
@@ -449,13 +207,12 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
         canvas[:] = (16, 20, 28)
 
-        # Tinh toan Letterboxing giu nguyen ti le goc
         top_bar_h = 42
         bot_bar_h = 56
         avail_w = win_w
         avail_h = max(100, win_h - top_bar_h - bot_bar_h)
 
-        disp_source = raw_display if (is_mobile and not cap.has_frame) else frame
+        disp_source = raw_display if (is_mob and not cap.has_frame) else frame
         if disp_source is None:
             continue
         dh, dw = disp_source.shape[:2]
@@ -465,14 +222,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         x_off = (avail_w - sc_w) // 2
         y_off = top_bar_h + (avail_h - sc_h) // 2
 
-        # Dat video vao trung tam canvas
         canvas[y_off : y_off + sc_h, x_off : x_off + sc_w] = cv2.resize(disp_source, (sc_w, sc_h))
-
-        # Ve khung vien video nhe
         cv2.rectangle(canvas, (x_off, y_off), (x_off + sc_w, y_off + sc_h), (40, 48, 64), 1)
 
-        # Ve luoi 3D / Rule of Thirds neu bat
-        if show_grid and frame_ready and not (is_mobile and not cap.has_frame):
+        if show_grid and frame_ready and not (is_mob and not cap.has_frame):
             gx1 = x_off + sc_w // 3
             gx2 = x_off + (2 * sc_w) // 3
             gy1 = y_off + sc_h // 3
@@ -482,17 +235,15 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             cv2.line(canvas, (gx2, y_off), (gx2, y_off + sc_h), grid_col, 1)
             cv2.line(canvas, (x_off, gy1), (x_off + sc_w, gy1), grid_col, 1)
             cv2.line(canvas, (x_off, gy2), (x_off + sc_w, gy2), grid_col, 1)
-            # Center crosshair
             cx, cy = x_off + sc_w // 2, y_off + sc_h // 2
             cv2.line(canvas, (cx - 12, cy), (cx + 12, cy), (96, 165, 250), 1)
             cv2.line(canvas, (cx, cy - 12), (cx, cy + 12), (96, 165, 250), 1)
 
-        # TOP BAR HUD
         cv2.rectangle(canvas, (0, 0), (win_w, top_bar_h), (11, 15, 23), -1)
         cv2.line(canvas, (0, top_bar_h), (win_w, top_bar_h), (34, 42, 56), 1)
 
-        src_label = "MOBILE WI-FI" if is_mobile else f"USB CAM [{current_cam}]"
-        src_color = (250, 180, 50) if is_mobile else (52, 211, 153)
+        src_label = "MOBILE WI-FI" if is_mob else f"USB CAM [{current_cam}]"
+        src_color = (250, 180, 50) if is_mob else (52, 211, 153)
         cv2.circle(canvas, (20, 21), 6, src_color, -1)
         cv2.putText(canvas, src_label, (34, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (241, 245, 249), 1)
 
@@ -502,7 +253,6 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         cv2.putText(canvas, info_txt, (200, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (148, 163, 184), 1)
 
         if writer is not None:
-            # Pulsing REC Badge
             rec_badge_w = 210
             rx = win_w - rec_badge_w - 15
             cv2.rectangle(canvas, (rx, 7), (rx + rec_badge_w, 35), (30, 20, 20), -1)
@@ -511,7 +261,6 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             cv2.putText(canvas, f"REC {elapsed:4.1f}s | {recorded_frames} f", (rx + 28, 26),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (254, 202, 202), 1)
 
-        # BOTTOM BAR TOOLBAR (Buttons with Mouse Click Hitboxes)
         cv2.rectangle(canvas, (0, win_h - bot_bar_h), (win_w, win_h), (11, 15, 23), -1)
         cv2.line(canvas, (0, win_h - bot_bar_h), (win_w, win_h - bot_bar_h), (34, 42, 56), 1)
 
@@ -519,8 +268,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
         btn_h = 36
         button_hitboxes.clear()
 
-        # Build interactive buttons
-        if is_mobile:
+        if is_mob:
             mob_btn = ("DISCONNECT_MOBILE", "NGAT MOBILE (X)", (153, 27, 27))
         elif mobile_cap is not None and mobile_cap.isOpened():
             mob_btn = ("MOBILE", "MOBILE: SAN SANG (M)", (21, 128, 61))
@@ -552,7 +300,6 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
         cv2.imshow(win_name, canvas)
 
-        # XU LY PHIM & SU KIEN CHUOT
         key = cv2.waitKey(1) & 0xFF
         action = clicked_action
         clicked_action = None
@@ -566,12 +313,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
         if trigger_grid:
             show_grid = not show_grid
-
         elif trigger_disconnect:
             _disconnect_mobile()
-
         elif trigger_record:
-            if is_mobile and not cap.has_frame:
+            if is_mob and not cap.has_frame:
                 print("Hay quet ma QR tren dien thoai va cho hinh anh hien thi truoc khi quay.")
             elif writer is None:
                 sdir.mkdir(parents=True, exist_ok=True)
@@ -582,7 +327,6 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 print(f"Bat dau quay ({w}x{h} @ {fps:.0f}fps)...")
             else:
                 cap.set_recording_state(False)
-                # Vet not toan bo frame con sot trong hang doi
                 final_frames = cap.pop_recorded_frames()
                 for nf in final_frames:
                     write_frame = nf
@@ -591,12 +335,11 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                     writer.write(write_frame)
                 actual_written = writer.release()
                 writer, saved = None, True
-                actual_fps = _finalize_recorded_video(
+                actual_fps = finalize_recorded_video(
                     temp_video_path, video_path, actual_written, time.time() - t0, fps, (w, h)
                 )
                 break
-
-        elif writer is None and not is_mobile and key in (ord("p"), ord("P")):
+        elif writer is None and not is_mob and key in (ord("p"), ord("P")):
             new_w, new_h = (1280, 720) if w >= 1920 else (1920, 1080)
             print(f"Dang doi do phan giai sang {new_w}x{new_h}...")
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, new_w)
@@ -609,19 +352,17 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             else:
                 cap.release()
                 time.sleep(0.2)
-                new_cap = _open_camera(current_cam, new_w, new_h, rec["fps"], rec_cfg=rec)
+                new_cap = open_camera(current_cam, new_w, new_h, rec["fps"], rec_cfg=rec)
                 if new_cap.isOpened():
                     cap = new_cap
-                    w, h, fps = _read_cam_props(cap, rec["fps"])
+                    w, h, fps = read_cam_props(cap, rec["fps"])
                     print(f"-> Da doi sang {w}x{h} @ {fps:.0f}fps")
                 else:
                     print("Khong doi duoc do phan giai, khoi phuc lai...")
-                    cap = _open_camera(current_cam, w, h, rec["fps"], rec_cfg=rec)
-
+                    cap = open_camera(current_cam, w, h, rec["fps"], rec_cfg=rec)
         elif trigger_mobile:
-            if not is_mobile:
+            if not is_mob:
                 _switch_source("mobile")
-
         elif trigger_cam or (writer is None and (ord("0") <= key <= ord("9"))):
             if ord("0") <= key <= ord("9"):
                 target_cam = key - ord("0")
@@ -633,11 +374,10 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                     target_cam = 0
             if target_cam != current_cam:
                 _switch_source(target_cam)
-
         elif trigger_quit:
             break
 
-    if writer is not None:  # thoat khi dang quay -> van luu va dong bo FPS
+    if writer is not None:
         cap.set_recording_state(False)
         final_frames = cap.pop_recorded_frames()
         for nf in final_frames:
@@ -646,10 +386,11 @@ def record_video(name: str | None, cfg: dict) -> str | None:
                 write_frame = cv2.resize(nf, (w, h))
             writer.write(write_frame)
         actual_written = writer.release()
-        actual_fps = _finalize_recorded_video(
+        actual_fps = finalize_recorded_video(
             temp_video_path, video_path, actual_written, time.time() - t0, fps, (w, h)
         )
         saved = True
+
     if mobile_cap is not None:
         try:
             mobile_cap.release()
@@ -657,7 +398,7 @@ def record_video(name: str | None, cfg: dict) -> str | None:
             pass
         mobile_cap = None
 
-    if cap is not None and not _is_mobile_cap(cap):
+    if cap is not None and not is_mobile_cap(cap):
         try:
             cap.release()
         except Exception:
@@ -668,15 +409,15 @@ def record_video(name: str | None, cfg: dict) -> str | None:
 
     if not saved:
         return None
-    meta = {
-        "source": "mobile" if _is_mobile_source(current_cam) else "recorded",
-        "camera": str(current_cam),
-        "width": w,
-        "height": h,
-        "fps": round(actual_fps, 2),
-        "created": datetime.now().isoformat(timespec="seconds"),
-    }
-    (sdir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    meta = SampleMetadata(
+        source="mobile" if is_mobile_source(current_cam) else "recorded",
+        camera=str(current_cam),
+        width=w,
+        height=h,
+        fps=round(actual_fps, 2),
+        created=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    meta.save(sdir)
     print(f"Da luu mau: data/samples/{name}/{cfg['video_file']}")
     return name
-

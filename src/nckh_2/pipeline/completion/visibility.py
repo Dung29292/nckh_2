@@ -290,9 +290,7 @@ def build_visual_hull(
             continue
         if mask.shape[1] != vw.width or mask.shape[0] != vw.height:
             mask = cv2.resize(mask, (vw.width, vw.height), interpolation=cv2.INTER_NEAREST)
-        # Slight 3px dilation avoids carving thin edges due to sub-pixel projection jitter
-        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
-
+        # Keep mask tight (no 5x5 dilation bloat that inflates an exterior umbrella cone)
         u, v, z = vw.project(vox_pts)
         ui = np.round(u).astype(np.int32)
         vi = np.round(v).astype(np.int32)
@@ -607,17 +605,19 @@ def render_virtual_views(
         # Close tiny 1-2px point-cloud splat pinholes so real observed regions aren't mistaken for holes
         mask_obs_closed = ndimage.binary_closing(mask_obs, iterations=2)
 
+        # Restrict mask_occ STRICTLY to genuine INTERIOR holes enclosed by observed silhouette!
+        # Never treat exterior Visual Hull cone overhang outside `obs_silhouette` as an object hole.
+        obs_silhouette = ndimage.binary_fill_holes(ndimage.binary_closing(mask_obs, iterations=5))
         if len(vh_pts) > 0:
             _, depth_vh, mask_vh = _splat_points_zbuf(
-                vh_pts, None, K, R, t, image_size, image_size, splat_radius=3
+                vh_pts, None, K, R, t, image_size, image_size, splat_radius=2
             )
             mask_vh = ndimage.binary_fill_holes(ndimage.binary_closing(mask_vh, iterations=2))
+            mask_occ = obs_silhouette & mask_vh & (~mask_obs_closed)
         else:
-            # Fallback convex hull envelope in 2D if Visual Hull wasn't built
-            mask_vh = ndimage.binary_fill_holes(ndimage.binary_dilation(mask_obs_closed, iterations=4))
+            mask_vh = obs_silhouette
             depth_vh = depth_obs.copy()
-
-        mask_occ = mask_vh & (~mask_obs_closed)
+            mask_occ = obs_silhouette & (~mask_obs_closed)
         renders.append(VirtualViewRender(
             name=vname,
             width=image_size,
@@ -729,3 +729,250 @@ def solve_biharmonic_depth_proxy(
     depth_out[valid_obs] = view.depth_obs[valid_obs]
     view.depth_proxy = depth_out.astype(np.float32)
     return view.depth_proxy
+
+
+def select_consistent_stationary_views(
+    views: list[CalibratedView],
+    min_warped_iou: float = 0.38,
+) -> list[CalibratedView]:
+    """Detect mid-video object repositioning via background homography and keep the longest stationary pass.
+
+    In `orbit` captures, if the user's hand moves/rotates the object on the table mid-video while
+    COLMAP tracks the stationary background table, consecutive frames have a valid background homography H
+    (on `mask == 0`), yet `IoU(warp(mask_i, H), mask_{i+1})` drops sharply. Splitting at such cuts and
+    retaining the longest consistent camera segment prevents multi-pose ghost shells from corrupting carving.
+    """
+    ordered = sorted(
+        [v for v in views if v.mask_path is not None and v.mask_path.exists()],
+        key=lambda x: x.name,
+    )
+    if len(ordered) < 6:
+        return ordered
+
+    # Only applicable when images exist to verify background motion
+    if any(v.image_path is None or not v.image_path.exists() for v in ordered):
+        return ordered
+
+    sift = cv2.SIFT_create(nfeatures=2500, contrastThreshold=0.003)
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    cuts: list[int] = [0]
+
+    # Prefer original sharp frames over resized dense frames for crisp wood/background SIFT tracking
+    def _resolve_bg_img(vw: CalibratedView) -> Path | None:
+        if vw.image_path is None:
+            return None
+        for anc in vw.image_path.parents:
+            sharp_cand = anc / "frames_sharp" / vw.image_path.name
+            if sharp_cand.exists():
+                return sharp_cand
+        return vw.image_path if vw.image_path.exists() else None
+
+    p0 = _resolve_bg_img(ordered[0])
+    if p0 is None:
+        return ordered
+    prev_im = cv2.imread(str(p0), cv2.IMREAD_GRAYSCALE)
+    prev_m = cv2.imread(str(ordered[0].mask_path), cv2.IMREAD_GRAYSCALE)
+    if prev_im is None or prev_m is None:
+        return ordered
+    if prev_m.shape != prev_im.shape:
+        prev_m = cv2.resize(prev_m, (prev_im.shape[1], prev_im.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    bg_kern = np.ones((9, 9), np.uint8)
+    prev_kp, prev_des = sift.detectAndCompute(prev_im, cv2.erode(255 - prev_m, bg_kern))
+
+    for i in range(1, len(ordered)):
+        pi = _resolve_bg_img(ordered[i])
+        if pi is None:
+            continue
+        cur_im = cv2.imread(str(pi), cv2.IMREAD_GRAYSCALE)
+        cur_m = cv2.imread(str(ordered[i].mask_path), cv2.IMREAD_GRAYSCALE)
+        if cur_im is None or cur_m is None:
+            continue
+        if cur_m.shape != cur_im.shape:
+            cur_m = cv2.resize(cur_m, (cur_im.shape[1], cur_im.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        cur_kp, cur_des = sift.detectAndCompute(cur_im, cv2.erode(255 - cur_m, bg_kern))
+        if (
+            prev_des is not None
+            and cur_des is not None
+            and len(prev_des) >= 12
+            and len(cur_des) >= 12
+        ):
+            matches = [
+                m for m, n in bf.knnMatch(prev_des, cur_des, k=2)
+                if m.distance < 0.75 * n.distance
+            ]
+            if len(matches) >= 10:
+                pts1 = np.float32([prev_kp[m.queryIdx].pt for m in matches])
+                pts2 = np.float32([cur_kp[m.trainIdx].pt for m in matches])
+                H, inl = cv2.findHomography(pts1, pts2, cv2.RANSAC, 4.0)
+                if H is not None and inl is not None and int(np.sum(inl)) >= 8:
+                    warped = cv2.warpPerspective(prev_m, H, (cur_m.shape[1], cur_m.shape[0])) > 127
+                    cur_bin = cur_m > 127
+                    union = float(np.sum(warped | cur_bin))
+                    if union > 50.0:
+                        iou = float(np.sum(warped & cur_bin)) / union
+                        if iou < float(min_warped_iou):
+                            cuts.append(i)
+
+        prev_im, prev_m, prev_kp, prev_des = cur_im, cur_m, cur_kp, cur_des
+
+    cuts.append(len(ordered))
+    if len(cuts) <= 2:
+        return ordered
+
+    # Pick the longest contiguous stationary camera segment
+    best_a, best_b = 0, len(ordered)
+    best_len = -1
+    for s_idx in range(len(cuts) - 1):
+        seg_len = cuts[s_idx + 1] - cuts[s_idx]
+        if seg_len > best_len:
+            best_len = seg_len
+            best_a, best_b = cuts[s_idx], cuts[s_idx + 1]
+
+    if best_len < max(6, len(ordered) // 3):
+        return ordered
+
+    print(
+        f"  [Silhouette] Phat hien vat the bi dich chuyen giua video -> giu doan camera tinh dai nhat "
+        f"{ordered[best_a].name}..{ordered[best_b - 1].name} ({best_len}/{len(ordered)} goc nhin)"
+    )
+    return ordered[best_a:best_b]
+
+
+def carve_point_cloud_with_masks(
+    pc: o3d.geometry.PointCloud,
+    sample_dir: Path,
+    carve_cfg: dict[str, Any],
+) -> tuple[o3d.geometry.PointCloud, list[CalibratedView]]:
+    """Direct ray-level Multi-View Silhouette Space Carving using calibrated Step 2 SAM-2 masks.
+
+    Eliminates MVS background bleed, grazing-angle table skirts, and multi-pass ghost points
+    before MLS / Interpolation / Poisson meshing.
+    """
+    if not bool(carve_cfg.get("enable", True)) or not sample_dir.exists() or len(pc.points) < 100:
+        return pc, []
+
+    views = load_calibrated_views(sample_dir)
+    valid_views = [v for v in views if v.mask_path is not None and v.mask_path.exists()]
+    if len(valid_views) < int(carve_cfg.get("min_visible_views", 5)):
+        return pc, valid_views
+
+    if bool(carve_cfg.get("check_stationary_homography", True)):
+        valid_views = select_consistent_stationary_views(
+            valid_views,
+            min_warped_iou=float(carve_cfg.get("homography_min_iou", 0.38)),
+        )
+
+    pts = np.asarray(pc.points, dtype=np.float64)
+    n_pts = len(pts)
+    fg_hits = np.zeros(n_pts, dtype=np.int32)
+    vis_cnt = np.zeros(n_pts, dtype=np.int32)
+
+    erode_px = int(carve_cfg.get("erode_px", 2))
+    kern = np.ones((2 * erode_px + 1, 2 * erode_px + 1), np.uint8) if erode_px > 0 else None
+
+    for vw in valid_views:
+        mask = cv2.imread(str(vw.mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        if mask.shape[1] != vw.width or mask.shape[0] != vw.height:
+            mask = cv2.resize(mask, (vw.width, vw.height), interpolation=cv2.INTER_NEAREST)
+        if kern is not None:
+            mask = cv2.erode(mask, kern, iterations=1)
+
+        u, v, z = vw.project(pts)
+        ui = np.round(u).astype(np.int32)
+        vi = np.round(v).astype(np.int32)
+        in_fov = (z > 0.05) & (ui >= 0) & (ui < vw.width) & (vi >= 0) & (vi < vw.height)
+        vis_cnt[in_fov] += 1
+        fg_hits[in_fov] += (mask[vi[in_fov], ui[in_fov]] > 127).astype(np.int32)
+
+    min_vis = min(int(carve_cfg.get("min_visible_views", 5)), max(2, len(valid_views) // 3))
+    min_cons = float(carve_cfg.get("min_mask_consistency", 0.88))
+    hit_ratio = fg_hits / np.maximum(vis_cnt, 1)
+    keep = (vis_cnt >= min_vis) & (hit_ratio >= min_cons)
+
+    # Guard: never wipe out the cloud if camera coordinate conventions mismatched
+    if int(np.sum(keep)) < max(200, int(0.08 * n_pts)):
+        return pc, valid_views
+
+    # Optional CIE Lab MAD filter to strip dark table-shadow / wood-grain points clinging to object rim
+    if bool(carve_cfg.get("filter_bg_color_bleed", True)) and pc.has_colors() and len(pc.colors) == n_pts:
+        cols_u8 = np.clip(np.asarray(pc.colors, dtype=np.float64) * 255.0, 0, 255).astype(np.uint8)
+        lab = cv2.cvtColor(cols_u8.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float64)
+        core = keep & (hit_ratio >= min(0.98, min_cons + 0.07))
+        ref_lab = lab[core] if int(np.sum(core)) >= 100 else lab[keep]
+        med_lab = np.median(ref_lab, axis=0)
+        c_dist = np.linalg.norm(lab - med_lab[None, :], axis=1)
+        d_core = c_dist[core] if int(np.sum(core)) >= 100 else c_dist[keep]
+        med_d = float(np.median(d_core))
+        mad_d = max(1.4826 * float(np.median(np.abs(d_core - med_d))), 2.5)
+        c_thr = med_d + float(carve_cfg.get("color_mad_sigma", 3.2)) * mad_d
+        # Strip extreme dark/wood shadow outliers even if grazing rays passed through foreground masks
+        is_dark_bleed = (lab[:, 0] < med_lab[0] - 2.6 * max(1.4826 * float(np.median(np.abs(ref_lab[:, 0] - med_lab[0]))), 4.0)) & (c_dist > c_thr)
+        color_ok = (~is_dark_bleed) & ((hit_ratio >= 0.97) | (c_dist <= c_thr))
+        if int(np.sum(keep & color_ok)) >= max(200, int(0.55 * np.sum(keep))):
+            keep &= color_ok
+
+    idx_keep = np.nonzero(keep)[0]
+    print(
+        f"  Silhouette carving ({len(valid_views)} masks, >= {min_cons:.0%}): "
+        f"{n_pts:,} -> {len(idx_keep):,} diem (loai {n_pts - len(idx_keep):,} diem phan thua ngoai mask)"
+    )
+    return pc.select_by_index(idx_keep), valid_views
+
+
+def trim_mesh_outside_masks(
+    mesh: o3d.geometry.TriangleMesh,
+    views: list[CalibratedView],
+    aligned_to_world_fn: Any,
+    min_consistency: float = 0.82,
+    dilate_px: int = 2,
+) -> tuple[o3d.geometry.TriangleMesh, int]:
+    """Project Poisson mesh vertices back into calibrated SAM-2 masks to slice off exterior bubbles/skirts.
+
+    Preserves 100% of smooth interior textureless surfaces (such as mouse palm domes and buttons)
+    that lie inside the 2D object silhouettes while cleanly removing exterior Poisson extrapolations.
+    """
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0 or len(views) < 4:
+        return mesh, 0
+
+    verts_aligned = np.asarray(mesh.vertices, dtype=np.float64)
+    verts_world = aligned_to_world_fn(verts_aligned)
+    n_v = len(verts_world)
+
+    fg_hits = np.zeros(n_v, dtype=np.int32)
+    vis_cnt = np.zeros(n_v, dtype=np.int32)
+    kern = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8) if dilate_px > 0 else None
+
+    for vw in views:
+        if vw.mask_path is None or not vw.mask_path.exists():
+            continue
+        mask = cv2.imread(str(vw.mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        if mask.shape[1] != vw.width or mask.shape[0] != vw.height:
+            mask = cv2.resize(mask, (vw.width, vw.height), interpolation=cv2.INTER_NEAREST)
+        if kern is not None:
+            mask = cv2.dilate(mask, kern, iterations=1)
+
+        u, v, z = vw.project(verts_world)
+        ui = np.round(u).astype(np.int32)
+        vi = np.round(v).astype(np.int32)
+        in_fov = (z > 0.05) & (ui >= 0) & (ui < vw.width) & (vi >= 0) & (vi < vw.height)
+        vis_cnt[in_fov] += 1
+        fg_hits[in_fov] += (mask[vi[in_fov], ui[in_fov]] > 127).astype(np.int32)
+
+    min_vis = max(2, len(views) // 4)
+    ratio = fg_hits / np.maximum(vis_cnt, 1)
+    outside_mask = (vis_cnt >= min_vis) & (ratio < float(min_consistency))
+    n_out = int(np.sum(outside_mask))
+    if n_out == 0 or int(np.sum(~outside_mask)) < 100:
+        return mesh, 0
+
+    out = o3d.geometry.TriangleMesh(mesh)
+    out.remove_vertices_by_mask(outside_mask)
+    out.remove_degenerate_triangles()
+    out.remove_unreferenced_vertices()
+    return out, n_out

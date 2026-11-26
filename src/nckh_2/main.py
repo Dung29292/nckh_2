@@ -1,78 +1,36 @@
-"""Diem vao cua pipeline.
+"""Cong CLI duy nhat cua du an nckh_2 (Video->3D Pipeline | Single .obj/.ply | Batch).
 
-  poetry run nckh                                  # menu tuong tac: quay moi / dung mau co san
-  poetry run nckh --source record --name box_01    # quay video moi, luu thanh mau box_01
-  poetry run nckh --source sample --name box_01    # dung mau co san
-  poetry run nckh --mode turntable                 # bo qua cau hoi che do quay
-  poetry run nckh --start 4 --until 4              # chi chay buoc 4
+Cac kich ban su dung chinh:
+  poetry run nckh                                                          # Menu tuong tac
+  poetry run nckh --source sample --name mouse_02 --start 1 --until 5      # Pipeline Video -> 3D du 5 buoc
+  poetry run nckh --source sample --name mouse_02 --start 5 --until 5 --profile curved_object
+  poetry run nckh --input model.obj --output out_dir --reference ref.obj   # Tinh chinh 1 file 3D roi
+  poetry run nckh --input model.obj --output out_dir --audit-only          # Chi kiem tra lech truc & 6 mat
+  poetry run nckh --batch-dir models_dir --output batch_out --pattern "**/*.obj"
 """
+from __future__ import annotations
+
 import argparse
-import json
+from pathlib import Path
 import sys
+from typing import Any
 
-from . import paths
-from .config import load_config
-from .input_source import choose_sample, list_samples, record_video
-STEP_TITLES = {
-    1: "Loc frame mo",
-    2: "Tach phong (Grounded-SAM 2)",
-    3: "COLMAP + 3DGS",
-    4: "Dung mesh khoi tao (Poisson)",
-    5: "Tinh chinh & lam min mesh",
-}
-
-
-def _run_step(step_idx: int, name: str, cfg: dict):
-    """Lazy import tung buoc khi thuc su chay, tranh crash khi thieu thu vien o buoc khac."""
-    try:
-        if step_idx == 1:
-            from . import step1_blur_filter
-            return step1_blur_filter.run(name, cfg)
-        elif step_idx == 2:
-            from . import step2_masking
-            return step2_masking.run(name, cfg)
-        elif step_idx == 3:
-            from . import step3_reconstruct
-            return step3_reconstruct.run(name, cfg)
-        elif step_idx == 4:
-            from . import step4_mesh_export
-            return step4_mesh_export.run(name, cfg)
-        elif step_idx == 5:
-            from . import step5_mesh_refine
-            return step5_mesh_refine.run(name, cfg)
-    except ImportError as exc:
-        print(f"\n[Loi] Khong the chay Buoc {step_idx} ({STEP_TITLES.get(step_idx)}) do thieu thu vien:")
-        print(f"  -> {exc}")
-        print(f"  Goi y: Hay kiem tra moi truong hoac cai dat thu vien phu hop cho rieng buoc nay.\n")
-        return None
-    raise ValueError(f"Khong ton tai buoc {step_idx}")
+from nckh_2.capture.recorder import record_video
+from nckh_2.capture.sample_store import choose_sample, list_samples
+from nckh_2.core import paths
+from nckh_2.core.config import list_profiles, load_config
+from nckh_2.core.types import SampleMetadata
+from nckh_2.pipeline.runner import (
+    MODES,
+    STEPS,
+    STEPS_NEED_MODE,
+    STEPS_NEED_SOURCE,
+    run_pipeline,
+)
 
 
-STEPS = {
-    1: (STEP_TITLES[1], lambda name, cfg: _run_step(1, name, cfg)),
-    2: (STEP_TITLES[2], lambda name, cfg: _run_step(2, name, cfg)),
-    3: (STEP_TITLES[3], lambda name, cfg: _run_step(3, name, cfg)),
-    4: (STEP_TITLES[4], lambda name, cfg: _run_step(4, name, cfg)),
-    5: (STEP_TITLES[5], lambda name, cfg: _run_step(5, name, cfg)),
-}
-
-# Buoc nao can biet nguon video / camera
-_STEPS_NEED_SOURCE = {1, 2}
-# Buoc nao can biet che do quay (orbit/turntable)
-_STEPS_NEED_MODE   = {2, 3}
-
-MODES = {
-    "orbit":      "Vat dung yen, camera di quanh vat",
-    "turntable":  "Camera dung yen, vat xoay (ban xoay / xoay tay)",
-}
-
-
-# ---------------------------------------------------------------------------
-# TIEN ICH
-# ---------------------------------------------------------------------------
-
-def _menu_source(cfg: dict) -> str:
-    print("=== nckh_2 - Pha 1 ===")
+def _menu_source(cfg: dict[str, Any]) -> str:
+    print("=== nckh_2 - 3D Spatial Reconstruction ===")
     print("  [1] Quay video truc tiep (Webcam may tinh -> mau moi)")
     print("  [2] Quay bang Camera dien thoai (Quet QR / Wi-Fi LAN)")
     print("  [3] Dung mau co san")
@@ -86,33 +44,22 @@ def _menu_source(cfg: dict) -> str:
             return "sample"
 
 
-def _load_meta(name: str) -> dict:
-    p = paths.sample_dir(name) / "meta.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
-    return {}
+def _load_meta(name: str) -> SampleMetadata:
+    return SampleMetadata.load(paths.sample_dir(name))
 
 
-def _save_meta(name: str, meta: dict) -> None:
-    p = paths.sample_dir(name) / "meta.json"
-    p.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+def _save_meta(name: str, meta: SampleMetadata) -> None:
+    meta.save(paths.sample_dir(name))
 
 
-def _resolve_sample(args: argparse.Namespace, cfg: dict, need_source: bool) -> tuple[str, str]:
-    """Tra ve (source, name). Chi hoi menu neu thuc su can."""
+def _resolve_sample(args: argparse.Namespace, cfg: dict[str, Any], need_source: bool) -> tuple[str, str | None]:
     if not need_source:
-        # Buoc chi can ten mau, khong can nguon video
         if args.name:
             return "sample", args.name
-        # Khong co --name: hoi chon mau co san (khong hoi record/sample)
         print("Chon mau can xu ly:")
         name = choose_sample(cfg["video_file"])
         return "sample", name
 
-    # Buoc can nguon (buoc 1, 2): hoi record, mobile hay sample
     source = args.source or _menu_source(cfg)
     if source == "mobile":
         cfg["record"]["camera"] = "mobile"
@@ -128,14 +75,12 @@ def _resolve_sample(args: argparse.Namespace, cfg: dict, need_source: bool) -> t
     return source, name
 
 
-def _resolve_mode(name: str, cfg: dict, cli_mode: str | None, need_mode: bool) -> str:
-    """Tra ve capture_mode. Chi hoi neu buoc can biet mode."""
-    meta    = _load_meta(name)
-    saved   = meta.get("capture_mode")
+def _resolve_mode(name: str, cfg: dict[str, Any], cli_mode: str | None, need_mode: bool) -> str:
+    meta = _load_meta(name)
+    saved = meta.capture_mode if meta.capture_mode else None
     default = saved or cfg["reconstruction"].get("capture_mode", "orbit")
 
     if not need_mode:
-        # Buoc 1, 4: khong can hoi, lay tu meta/config
         return default
 
     if cli_mode:
@@ -158,57 +103,154 @@ def _resolve_mode(name: str, cfg: dict, cli_mode: str | None, need_mode: bool) -
         mode = default
 
     if saved != mode:
-        meta["capture_mode"] = mode
+        meta.capture_mode = mode
         _save_meta(name, meta)
     return mode
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+def _apply_refine_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Ap dung cac co ghi de nhanh tu CLI vao nhanh mesh_refine trong cfg."""
+    mr = cfg.setdefault("mesh_refine", {})
+    if args.align_mode is not None:
+        mr.setdefault("alignment", {})["align_mode"] = args.align_mode
+    if args.smooth_mode is not None:
+        mr.setdefault("smoothing", {})["mode"] = args.smooth_mode
+    if args.no_remesh:
+        mr.setdefault("remesh", {})["enable"] = False
+    if args.target_edge_frac is not None:
+        mr.setdefault("remesh", {})["target_edge_frac"] = args.target_edge_frac
+    if args.max_drift_frac is not None:
+        mr.setdefault("smoothing", {})["max_drift_frac"] = args.max_drift_frac
+    if args.save_intermediates:
+        mr.setdefault("audit", {})["save_intermediates"] = True
+
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    ap = argparse.ArgumentParser(description="nckh_2 pipeline")
-    ap.add_argument("--source",  choices=["record", "mobile", "sample"],
-                    help="nguon du lieu: record = webcam, mobile = camera dien thoai (QR), sample = mau co san")
-    ap.add_argument("--name",    help="ten mau")
-    ap.add_argument("--camera",  help="chi so camera, 'mobile', hoac URL (ghi de config)")
+    avail_profiles = list_profiles()
+    profile_help = f"ho so cau hinh trong muc profiles cua configs/default.yaml (co san: {', '.join(avail_profiles)})"
+
+    ap = argparse.ArgumentParser(description="nckh_2 - 3D Spatial Reconstruction & Mesh Refinement CLI")
+    # --- Nhom 1: Cau hinh chung & ho so rieng ---
+    ap.add_argument("--config", type=Path, default=None, help="duong dan YAML cau hinh tuy chon")
+    ap.add_argument("--floorplan-config", type=Path, default=None, help="duong dan configs/floorplan.yml tuy chon")
+    ap.add_argument("--profile", default=None, help=profile_help)
+    ap.add_argument(
+        "--route-mode",
+        choices=["auto", "freeform_object", "architectural_planar", "room_layout", "topdown_object"],
+        default=None,
+        help="dinh tuyen giai thuat hinh hoc theo loai be mat / khong gian (Section 6.2 nckh.pdf)",
+    )
+
+    # --- Nhom 2: Pipeline Video -> 3D (Buoc 1..5) ---
+    ap.add_argument("--source", choices=["record", "mobile", "sample"],
+                    help="nguon video: record = webcam, mobile = camera dien thoai (QR), sample = mau co san")
+    ap.add_argument("--name", help="ten mau trong data/samples/")
+    ap.add_argument("--camera", help="chi so camera, 'mobile', hoac URL (ghi de config)")
     ap.add_argument("--host-ip", help="ghi de dia chi IP LAN phat QR cho camera dien thoai")
-    ap.add_argument("--prompt",  help="tu khoa nhan dien vat the cho Grounded-SAM 2 (ghi de config)")
-    ap.add_argument("--mode",    choices=list(MODES),
-                    help="che do quay: orbit | turntable")
-    ap.add_argument("--start",   type=int, default=1, choices=list(STEPS),
-                    help="bat dau tu buoc nay (mac dinh: 1)")
-    ap.add_argument("--until",   type=int, default=None, choices=list(STEPS),
-                    help="chay den buoc nay (mac dinh: bang --start)")
-    ap.add_argument("--only-record", action="store_true",
-                    help="chi quay / chon mau video roi dung, khong chay cac buoc xu ly tiep theo")
+    ap.add_argument("--prompt", help="tu khoa nhan dien vat the cho Grounded-SAM 2")
+    ap.add_argument("--mode", choices=list(MODES), help="che do quay: orbit | turntable")
+    ap.add_argument("--start", type=int, default=1, choices=list(STEPS), help="bat dau tu buoc nay (mac dinh: 1)")
+    ap.add_argument("--until", type=int, default=None, choices=list(STEPS), help="chay den buoc nay (mac dinh: bang --start)")
+    ap.add_argument("--only-record", action="store_true", help="chi quay / chon mau video roi dung")
+
+    # --- Nhom 3: Tinh chinh 1 file 3D roi hoac chay hang loat (Batch) ---
+    ap.add_argument("--input", type=Path, default=None, help="duong dan 1 file .obj/.ply roi can tinh chinh")
+    ap.add_argument("--batch-dir", type=Path, default=None, help="thu muc chua nhieu file .obj/.ply can chay hang loat")
+    ap.add_argument("--output", type=Path, default=None, help="file hoac thu muc dau ra cho --input / --batch-dir")
+    ap.add_argument("--pattern", default="*.obj", help="glob pattern cho --batch-dir (mac dinh: '*.obj')")
+    ap.add_argument("--reference", type=Path, default=None, help="file tham chieu .obj/.ply cho kiem dinh 6 mat")
+    ap.add_argument("--ref-dir", type=Path, default=None, help="thu muc song song chua file tham chieu cho --batch-dir")
+
+    # --- Nhom 4: Co ghi de nhanh cho Buoc 5 (Mesh Refine & Audit) ---
+    ap.add_argument("--align-mode", choices=["preserve", "pca_canonical", "reference_icp"], default=None)
+    ap.add_argument("--smooth-mode", choices=["hybrid", "taubin", "bilateral_normal", "none"], default=None)
+    ap.add_argument("--no-remesh", action="store_true", help="bo qua PyMeshLab isotropic remeshing")
+    ap.add_argument("--target-edge-frac", type=float, default=None, help="do dai canh remesh / bbox_diag")
+    ap.add_argument("--max-drift-frac", type=float, default=None, help="gioi han do troi P95 / bbox_diag")
+    ap.add_argument("--audit-only", action="store_true", help="chi chan doan lech truc & 6 mat, khong sua mesh")
+    ap.add_argument("--save-intermediates", action="store_true", help="luu them file .obj trung gian tung pha")
+    ap.add_argument("--fail-fast", action="store_true", help="dung ngay khi gap loi trong --batch-dir")
     args = ap.parse_args()
 
-    # --until mac dinh bang --start (khong truyen = chi chay 1 buoc)
+    paths.ensure_base_dirs()
+    cfg = load_config(
+        config_path=args.config,
+        profile=args.profile,
+        floorplan_path=args.floorplan_config,
+        include_floorplan=(args.route_mode is not None or args.floorplan_config is not None),
+    )
+    if args.route_mode is not None:
+        cfg.setdefault("surface_router", {})["mode"] = args.route_mode
+    _apply_refine_cli_overrides(cfg, args)
+
+    # -------------------------------------------------------------------------
+    # LUONG 0: Dinh tuyen bai toan & Tai tao 3D / CAD / BIM tu Point Cloud (.ply)
+    # -------------------------------------------------------------------------
+    if args.input is not None and args.route_mode is not None and args.input.suffix.lower() == ".ply":
+        from nckh_2.backends.geometry import load_gaussian_ply
+        from nckh_2.pipeline.surface_router import route_and_reconstruct
+
+        out_target = args.output or (args.input.parent / f"{args.input.stem}_routed")
+        pc_in = load_gaussian_ply(args.input)
+        res = route_and_reconstruct(pc_in, cfg, out_dir=out_target, stem=args.input.stem)
+        print(f"\n[Router] Route='{res['routing']['route']}' hoan tat -> {out_target}")
+        return
+
+    # -------------------------------------------------------------------------
+    # LUONG A: Chay hang loat (Batch) tren thu muc tai san 3D
+    # -------------------------------------------------------------------------
+    if args.batch_dir is not None:
+        from nckh_2.pipeline.refine.batch import run_batch_refine
+
+        out_dir = args.output or (args.batch_dir / "refined_batch")
+        run_batch_refine(
+            args.batch_dir,
+            out_dir,
+            pattern=args.pattern,
+            cfg=cfg,
+            ref_dir=args.ref_dir,
+            audit_only=args.audit_only,
+            fail_fast=args.fail_fast,
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # LUONG B: Tinh chinh / Kiem dinh 1 file .obj / .ply roi bat ky
+    # -------------------------------------------------------------------------
+    if args.input is not None:
+        from nckh_2.pipeline.refine.engine import refine_obj_file
+
+        out_target = args.output or (args.input.parent / f"{args.input.stem}_refine_audit")
+        rep = refine_obj_file(
+            args.input,
+            out_target,
+            r_cfg=cfg.get("mesh_refine", {}),
+            reference_path=args.reference,
+            audit_only=args.audit_only,
+        )
+        print(f"\n[Refine] Hoan tat trong {rep.elapsed_sec:.2f}s -> {out_target}")
+        return
+
+    # -------------------------------------------------------------------------
+    # LUONG C: Pipeline Video -> 3D (Buoc 1..5)
+    # -------------------------------------------------------------------------
     if args.until is None:
         args.until = args.start
-
     if args.start > args.until:
         ap.error(f"--start ({args.start}) phai <= --until ({args.until})")
-
-    paths.ensure_base_dirs()
-    cfg = load_config()
 
     if args.camera is not None:
         cfg["record"]["camera"] = args.camera
     if args.host_ip is not None:
         cfg["record"]["mobile_host_ip"] = args.host_ip
 
-    # Xac dinh xem cac buoc se chay co can source/mode khong
-    steps_to_run  = set(range(args.start, args.until + 1))
-    need_source   = bool(steps_to_run & _STEPS_NEED_SOURCE)
-    need_mode     = bool(steps_to_run & _STEPS_NEED_MODE)
+    steps_to_run = set(range(args.start, args.until + 1))
+    need_source = bool(steps_to_run & STEPS_NEED_SOURCE)
+    need_mode = bool(steps_to_run & STEPS_NEED_MODE)
 
-    # Lay ten mau (va nguon neu can)
     source, name = _resolve_sample(args, cfg, need_source)
     if not name:
         print("Khong co mau de xu ly. Thoat.")
@@ -218,34 +260,24 @@ def main() -> None:
         print(f"\nDa luu mau: {name}. Hoan tat theo yeu cau (--only-record).")
         return
 
-    # Lay va luu prompt nhan dien vat the (buoc 2)
     meta = _load_meta(name)
     if args.prompt:
         cfg["masking"]["prompt"] = args.prompt
-        meta["prompt"] = args.prompt
+        meta.prompt = args.prompt
         _save_meta(name, meta)
-    elif meta.get("prompt"):
-        cfg["masking"]["prompt"] = meta["prompt"]
+    elif meta.prompt:
+        cfg["masking"]["prompt"] = meta.prompt
     else:
-        # Neu ten mau co tien to nhu mouse_01, bottle_02, vv.
         prefix = name.split("_")[0].lower()
         if prefix and prefix not in ("sample", "video") and cfg["masking"]["prompt"] == "box":
             cfg["masking"]["prompt"] = prefix
 
-    # Lay che do quay (chi hoi khi buoc 2 hoac 3 chay)
     mode = _resolve_mode(name, cfg, args.mode, need_mode)
     cfg["reconstruction"]["capture_mode"] = mode
 
-    print(f"\n>>> Mau: {name}  |  Buoc: {args.start}-{args.until}  |  Mode: {mode}  |  Prompt: '{cfg['masking']['prompt']}'")
-
-    for step in range(args.start, args.until + 1):
-        title, fn = STEPS[step]
-        print(f"\n--- Buoc {step}: {title} ---")
-        try:
-            fn(name, cfg)
-        except NotImplementedError as e:
-            print(e)
-            break
+    prof_tag = f"  |  Profile: {args.profile}" if args.profile else ""
+    print(f"\n>>> Mau: {name}  |  Buoc: {args.start}-{args.until}  |  Mode: {mode}  |  Prompt: '{cfg['masking']['prompt']}'{prof_tag}")
+    run_pipeline(name, cfg, start=args.start, until=args.until)
 
 
 if __name__ == "__main__":
