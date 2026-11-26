@@ -183,7 +183,8 @@ def fill_point_cloud_holes(
     vh: VisualHull | None = None
     if bool(cfg.get("use_visual_hull", True)) and (preloaded_views or (sample_dir is not None and sample_dir.exists())):
         try:
-            views = preloaded_views if preloaded_views else select_consistent_stationary_views(load_calibrated_views(sample_dir))  # type: ignore[arg-type]
+            all_views = preloaded_views if preloaded_views else load_calibrated_views(sample_dir)  # type: ignore[arg-type]
+            views = preloaded_views if preloaded_views else select_consistent_stationary_views(all_views)
             if len(views) >= 2:
                 vh = build_visual_hull(
                     pts_obs,
@@ -192,6 +193,23 @@ def fill_point_cloud_holes(
                     pad_frac=float(cfg.get("visual_hull_pad_frac", 0.12)),
                     min_mask_consistency=float(cfg.get("visual_hull_consistency", 0.90)),
                 )
+                if len(views) < len(all_views) and bool(cfg.get("carve_shifted_ghosts", True)):
+                    in_vh = vh.contains_points(pts_obs, dilate_voxels=1)
+                    if int(np.sum(in_vh)) >= max(100, int(0.25 * len(pts_obs))):
+                        removed_ghost = int(len(pts_obs) - np.sum(in_vh))
+                        if removed_ghost > 0:
+                            print(f"  [Visual Hull Carve] Loai {removed_ghost:,} diem bong ma do vat the dich chuyen giua video")
+                            pts_obs = pts_obs[in_vh]
+                            cols_obs = cols_obs[in_vh]
+                            if nrms_obs is not None:
+                                nrms_obs = nrms_obs[in_vh]
+                            n_obs = len(pts_obs)
+                            pc = o3d.geometry.PointCloud()
+                            pc.points = o3d.utility.Vector3dVector(pts_obs)
+                            if has_cols:
+                                pc.colors = o3d.utility.Vector3dVector(cols_obs)
+                            if nrms_obs is not None:
+                                pc.normals = o3d.utility.Vector3dVector(nrms_obs)
         except Exception as err:
             print(f"  [Interpolation] Bo qua Visual Hull ({err})")
 

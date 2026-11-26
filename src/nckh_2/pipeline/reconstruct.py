@@ -71,7 +71,16 @@ def _finish_process_data(sdir: Path, nf_dir: Path, cfg: dict[str, Any] | None = 
 
 def _process_data_colmap_sfm(sdir: Path, nf_dir: Path, cfg: dict[str, Any]) -> Path:
     rc = cfg["reconstruction"]
-    use_mask = rc.get("capture_mode", "orbit") == "turntable"
+    mask_files = list((sdir / "masks").glob("frame_*.png"))
+    sfm_mask_mode = str(rc.get("sfm_mask_mode", "auto")).strip().lower()
+    if sfm_mask_mode == "always":
+        use_mask = len(mask_files) > 0
+    elif sfm_mask_mode == "never":
+        use_mask = False
+    else:
+        # auto: turntable rotates object against moving background -> MUST mask SfM;
+        # orbit moves camera around static desk -> keep static bg for rock-solid SfM poses, then mask Dense MVS!
+        use_mask = rc.get("capture_mode", "orbit") == "turntable" and len(mask_files) > 0
 
     colmap_dir = nf_dir / "colmap"
     (colmap_dir / "sparse").mkdir(parents=True)

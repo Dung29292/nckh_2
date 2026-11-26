@@ -241,6 +241,28 @@ def _align_point_cloud_upright(
             n_z = pca_thin_z
             if cam_centers is not None and len(cam_centers) > 0 and np.dot(n_z, cam_centers.mean(axis=0) - m_cent) < 0:
                 n_z = -n_z
+        n_z /= np.linalg.norm(n_z)
+
+        # Refine gravity axis via RANSAC on lower boundary band (bottom 15% along initial n_z)
+        z_proj = centered @ n_z
+        z_lo, z_hi = float(np.percentile(z_proj, 1)), float(np.percentile(z_proj, 99))
+        band_idx = np.nonzero(z_proj <= z_lo + 0.15 * max(z_hi - z_lo, 1e-6))[0]
+        if len(band_idx) >= 50:
+            band_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(centered[band_idx]))
+            try:
+                dist_thr = max(0.015 * max(z_hi - z_lo, 1e-6), 1e-5)
+                p_model, p_inl = band_pc.segment_plane(distance_threshold=dist_thr, ransac_n=3, num_iterations=600)
+                p_n = np.asarray(p_model[:3], dtype=np.float64)
+                p_nl = float(np.linalg.norm(p_n))
+                if p_nl > 1e-8 and len(p_inl) >= max(30, int(0.35 * len(band_idx))):
+                    p_n /= p_nl
+                    if float(np.dot(p_n, n_z)) < 0.0:
+                        p_n = -p_n
+                    # Accept RANSAC base plane if within 20 deg of initial gravity axis
+                    if float(np.dot(p_n, n_z)) >= 0.94:
+                        n_z = p_n
+            except Exception:
+                pass
     n_z /= np.linalg.norm(n_z)
 
     proj = centered - np.outer(centered @ n_z, n_z)
@@ -322,13 +344,39 @@ def _reconstruct_poisson(
         if orient_k >= 3:
             pcd.orient_normals_consistent_tangent_plane(k=orient_k)
 
-    depth = int(e.get("poisson_depth", 7))
+    depth = int(e.get("poisson_depth", 8))
     scale = float(e.get("poisson_scale", 1.1))
+    point_weight = float(e.get("poisson_point_weight", 4.0))
     linear_fit = bool(e.get("poisson_linear_fit", True))
-    print(f"  Poisson depth={depth}, scale={scale}, linear_fit={linear_fit}...")
-    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=depth, scale=scale, linear_fit=linear_fit)
-    dens = np.asarray(dens, dtype=np.float64)
+    print(f"  Poisson depth={depth}, scale={scale}, point_weight={point_weight}, linear_fit={linear_fit}...")
+
+    mesh = None
+    dens = np.empty(0, dtype=np.float64)
+    try:
+        import pymeshlab
+        ms_p = pymeshlab.MeshSet()
+        ms_p.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(pcd.points, dtype=np.float64),
+            v_normals_matrix=np.asarray(pcd.normals, dtype=np.float64),
+        ))
+        ms_p.generate_surface_reconstruction_screened_poisson(
+            depth=depth,
+            scale=scale,
+            pointweight=point_weight,
+            preclean=True,
+        )
+        res_p = ms_p.current_mesh()
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(np.asarray(res_p.vertex_matrix(), dtype=np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(np.asarray(res_p.face_matrix(), dtype=np.int32))
+        if res_p.has_vertex_scalar():
+            dens = np.asarray(res_p.vertex_scalar_array(), dtype=np.float64)
+    except Exception as err:
+        print(f"  [Canh bao] PyMeshLab Screened Poisson loi ({err}) -> dung Open3D Poisson")
+        mesh, dens_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=depth, scale=scale, linear_fit=linear_fit)
+        dens = np.asarray(dens_o3d, dtype=np.float64)
+
     print(f"  Poisson raw: {len(mesh.vertices):,} dinh, {len(mesh.triangles):,} tam giac")
 
     q = float(e.get("poisson_density_quantile", 0.0))
@@ -342,9 +390,24 @@ def _reconstruct_poisson(
             mesh.remove_vertices_by_mask(low_dens_mask)
             print(f"  Poisson density trim (q={q:.3f}, thr={dens_thr:.4f}): loai {n_pruned:,} dinh mat do thap")
 
+    # Strict bounding hull clamp: never allow synthetic flare outside observed point cloud hull
     bbox = pcd.get_axis_aligned_bounding_box()
-    pad = float(e.get("poisson_hull_pad_frac", 0.03)) * float(np.linalg.norm(bbox.get_extent()))
-    mesh = mesh.crop(o3d.geometry.AxisAlignedBoundingBox(bbox.min_bound - pad, bbox.max_bound + pad))
+    pad = float(e.get("poisson_hull_pad_frac", 0.01)) * float(np.linalg.norm(bbox.get_extent()))
+    crop_min = bbox.min_bound - pad
+    crop_min[2] = bbox.min_bound[2]  # Strictly forbid geometry extending below support plane Z_min
+    mesh = mesh.crop(o3d.geometry.AxisAlignedBoundingBox(crop_min, bbox.max_bound + pad))
+
+    # Prune any spurious flare vertices farther than poisson_max_dist_frac * diag from genuine points
+    max_dist_frac = float(e.get("poisson_max_dist_frac", 0.05))
+    if max_dist_frac > 0.0 and len(mesh.vertices) > 0:
+        obs_pts = np.asarray(pcd.points, dtype=np.float64)
+        v_mesh = np.asarray(mesh.vertices, dtype=np.float64)
+        v_dists, _ = nn_query(obs_pts, v_mesh)
+        far_mask = v_dists > (max_dist_frac * diag)
+        n_far = int(np.sum(far_mask))
+        if 0 < n_far < len(v_mesh):
+            mesh.remove_vertices_by_mask(far_mask)
+            print(f"  Poisson flare prune (>{max_dist_frac:.1%} diag): loai {n_far:,} dinh ngoai suy xa")
 
     # Giu moi vat the hop le (>= 5% cum lon nhat) de ho tro canh 2+ vat the khac hinh dang
     keep_ratio = float(e.get("poisson_cluster_keep_ratio", 0.05))
@@ -659,11 +722,12 @@ def _clip_and_cap_planar_base(
 def _cap_bottom_mesh(mesh: o3d.geometry.TriangleMesh, diag: float, e: dict[str, Any]) -> o3d.geometry.TriangleMesh:
     if len(mesh.vertices) == 0:
         return mesh
+    pw = float(e.get("poisson_point_weight", 4.0))
     if bool(e.get("planar_base_cap", True)):
         mesh = _clip_and_cap_planar_base(mesh, diag, e)
-        mesh = ground_mesh_z0(mesh)
+        # Preserve exact coordinate alignment with point_cloud_clean.ply (no duplicate ground_mesh_z0 offset)
         if not mesh.is_watertight() and bool(e.get("make_watertight", True)):
-            mesh = make_watertight(mesh)
+            mesh = make_watertight(mesh, point_weight=pw)
         return mesh
 
     tol = float(e.get("floor_snap_frac", 0.02)) * diag
@@ -677,7 +741,7 @@ def _cap_bottom_mesh(mesh: o3d.geometry.TriangleMesh, diag: float, e: dict[str, 
     mesh.remove_unreferenced_vertices()
     mesh.remove_degenerate_triangles()
     mesh.remove_non_manifold_edges()
-    return make_watertight(mesh)
+    return make_watertight(mesh, point_weight=pw)
 
 
 def _finalize_mesh(mesh: o3d.geometry.TriangleMesh, diag: float, e: dict[str, Any], has_plane: bool) -> o3d.geometry.TriangleMesh:

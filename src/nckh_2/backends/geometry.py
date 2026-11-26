@@ -628,7 +628,7 @@ def clean_mesh_topology(mesh: o3d.geometry.TriangleMesh, keep_ratio: float = 0.0
     return mesh
 
 
-def make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+def make_watertight(mesh: o3d.geometry.TriangleMesh, point_weight: float = 4.0) -> o3d.geometry.TriangleMesh:
     """Bit cac chu trinh bien (PyMeshLab neu co, khong thi fan-fill tai centroid)."""
     if len(mesh.triangles) == 0 or mesh.is_watertight():
         return mesh
@@ -662,6 +662,21 @@ def make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMes
             out_verts = np.asarray(res.vertex_matrix(), dtype=np.float64)
             out.vertices = o3d.utility.Vector3dVector(out_verts)
             out.triangles = o3d.utility.Vector3iVector(res.face_matrix())
+        if not out.is_watertight() and len(out.triangles) >= 100:
+            # NEVER run a second Poisson pass (which can inflate trumpet flares below Z_min!).
+            # Instead, resolve micro self-intersections strictly on-surface via isotropic remeshing + hole close.
+            ms.meshing_isotropic_explicit_remeshing(iterations=2, targetlen=pymeshlab.PercentageValue(0.6))
+            ms.meshing_repair_non_manifold_edges()
+            ms.meshing_repair_non_manifold_vertices()
+            ms.meshing_close_holes(maxholesize=100000, refinehole=False)
+            ms.meshing_repair_non_manifold_edges()
+            ms.meshing_repair_non_manifold_vertices()
+            res_w = ms.current_mesh()
+            out_verts = np.asarray(res_w.vertex_matrix(), dtype=np.float64)
+            out.vertices = o3d.utility.Vector3dVector(out_verts)
+            out.triangles = o3d.utility.Vector3iVector(res_w.face_matrix())
+            out = clean_mesh_topology(out, keep_ratio=0.5)
+            out_verts = np.asarray(out.vertices, dtype=np.float64)
         if src_cols is not None and len(out_verts) > 0:
             _, idx = nn_query(src_verts, out_verts)
             out.vertex_colors = o3d.utility.Vector3dVector(src_cols[idx])
@@ -671,7 +686,7 @@ def make_watertight(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMes
         out.remove_unreferenced_vertices()
         out.compute_triangle_normals()
         out.compute_vertex_normals()
-        print(f"  PyMeshLab close holes: watertight={out.is_watertight()}")
+        print(f"  PyMeshLab watertight consolidation: watertight={out.is_watertight()}")
         if out.is_watertight():
             return out
         # Continue to fan-fill fallback on `out` if any residual open loops remain

@@ -66,6 +66,7 @@ reconstruction:
   method: colmap_mvs           # COLMAP Dense MVS (deterministic geometry + native normals)
   pose_method: colmap
   capture_mode: turntable
+  sfm_mask_mode: auto          # auto (mask SfM in turntable, keep static bg for poses in orbit; ALWAYS mask Dense MVS) | always | never
   camera_model: OPENCV         # Shared radial + tangential lens distortion model
   single_camera: true          # Enforce shared intrinsic matrix K across all frames
   matching_method: exhaustive  # Sequential + loop closure + exhaustive all-pairs
@@ -97,9 +98,10 @@ mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 
   bpa_r3_mult: 5.0              # he so ban kinh lan cap 3
   poisson_depth: 8              # Eq. (12) Delta chi = div V: Octree depth 8 (can bang chi tiet & watertight)
   poisson_scale: 1.1
+  poisson_point_weight: 4.0     # Strict point adherence (prevents bubble/trumpet inflation over open recesses)
   poisson_density_quantile: 0.075 # cat 7.5% dinh mat do thap nhat de chong bong bong ngoai suy
   poisson_density_trim_percentile: 0.0 # du phong theo % neu poisson_density_quantile = 0
-  poisson_max_dist_frac: 0.0    # 0.0 = khong cat xa theo khoang cach (tranh xe rach mat vat the)
+  poisson_max_dist_frac: 0.05   # Cat bo moi phan luoi ngoai suy xa diem quan sat thuc > 5% duong cheo (chong loa ken)
   poisson_cluster_keep_ratio: 0.15 # giu khoi vat the chinh, loai bo manh vo troi noi
   poisson_linear_fit: true
   gaussian_opacity_min: 0.20    # nguong loc opacity khi doc 3DGS .ply
@@ -156,21 +158,21 @@ mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 
   table_clearance_frac: 0.006   # cat sach ria chan mat ban
 
   # --- Cat phan thua ngoai vat the (vay Poisson) ---
-  poisson_hull_pad_frac: 0.03
+  poisson_hull_pad_frac: 0.01
 
   # --- Can thang dung (Z-up) & dat len mat san (Z=0) ---
   align_upright: true           # tu dong can thang truc Z-up, dua ve goc (0,0) va tiep dat sat san Z=0
 
-  # --- Bu khuyet vat the bang noi suy (Per-Component Symmetry + Visual Hull + Biharmonic, 0 VRAM) ---
+  # --- Bu khuyet vat the bang noi suy (TAT mac dinh de khong tao tuong gia / loa ken ngoai bounding hull) ---
   interpolation_fill:
-    enable: true                # tu dong noi suy lap lo vung tron/che khuat truoc khi dung Poisson
+    enable: false               # false: chi dung diem quan sat thuc, khong noi suy tuong ben gia tao
     use_visual_hull: true       # dung Mask Buoc 2 + Camera COLMAP lam bien chan ngoai
     visual_hull_res: 64         # do phan giai luoi voxel Visual Hull
     visual_hull_pad_frac: 0.25  # bien dem sat vat the
     visual_hull_consistency: 0.80 # ty le goc nhin dong thuan
-    use_symmetry: true          # noi suy doi xung cuc bo cho tung vat the (tu bo qua neu bat doi xung)
+    use_symmetry: false         # tat noi suy doi xung gia tao
     symmetry_min_overlap: 0.72  # chi nhan mat phang doi xung neu ICP overlap >= 72%
-    use_biharmonic: true        # chi lap lo khuyet NOI VI ben trong bong vat the
+    use_biharmonic: false       # tat noi suy biharmonic de tranh tao loa ken/flare
     virtual_view_size: 256      # do phan giai camera ao (nhanh ~2-3s, 0 VRAM)
     max_added_ratio: 0.60       # gioi han diem noi suy <= 60% diem thuc
 
