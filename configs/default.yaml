@@ -96,10 +96,10 @@ mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 
   bpa_r1_mult: 1.2              # he so ban kinh lan cap 1
   bpa_r2_mult: 2.5              # he so ban kinh lan cap 2
   bpa_r3_mult: 5.0              # he so ban kinh lan cap 3
-  poisson_depth: 8              # Eq. (12) Delta chi = div V: Octree depth 8 (can bang chi tiet & watertight)
+  poisson_depth: 7              # Eq. (12) Delta chi = div V: Octree depth 7 (muot, khong gai nhon tren vat cong)
   poisson_scale: 1.1
-  poisson_point_weight: 4.0     # Strict point adherence (prevents bubble/trumpet inflation over open recesses)
-  poisson_density_quantile: 0.075 # cat 7.5% dinh mat do thap nhat de chong bong bong ngoai suy
+  poisson_point_weight: 2.0     # Can bang bam sat diem thuc & khu nhieu gai (2.0 cho vat cong muot)
+  poisson_density_quantile: 0.05 # cat 5% dinh mat do thap nhat de chong bong bong ngoai suy
   poisson_density_trim_percentile: 0.0 # du phong theo % neu poisson_density_quantile = 0
   poisson_max_dist_frac: 0.05   # Cat bo moi phan luoi ngoai suy xa diem quan sat thuc > 5% duong cheo (chong loa ken)
   poisson_cluster_keep_ratio: 0.15 # giu khoi vat the chinh, loai bo manh vo troi noi
@@ -144,7 +144,7 @@ mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 
   # true: tu dong cat phang day & bit kin 2D Delaunay/Ear-clipping thanh khoi 2-manifold watertight
   make_watertight: true
   planar_base_cap: true         # Object-agnostic planar base slicing & 2D polygon capping
-  base_slice_frac: 0.035        # Cat bo 3.5% vay thap mat do thap o chan day truoc khi bit phang
+  base_slice_frac: 0.06         # Cat sach 6% ria chan rang cua tiep giap ban xoay truoc khi bit day phang
   floor_snap_frac: 0.02
 
   # --- Loc mat phang ban xoay / de hoa van (Dual-Validated RANSAC) ---
@@ -163,7 +163,12 @@ mesh_export:         # Buoc 4 (Freeform Differential Pipeline: Eq. 6 MLS -> Eq. 
   # --- Can thang dung (Z-up) & dat len mat san (Z=0) ---
   align_upright: true           # tu dong can thang truc Z-up, dua ve goc (0,0) va tiep dat sat san Z=0
 
-  # --- Bu khuyet vat the bang noi suy (TAT mac dinh de khong tao tuong gia / loa ken ngoai bounding hull) ---
+  # --- Bo sung be mat Visual Hull (CHI bat trong profile sharp_cad cho vat hop den khong van, TAT mac dinh de tranh chop tam giac duoi day) ---
+  visual_hull_surface_fill: false
+  visual_hull_res: 96
+  visual_hull_pad_frac: 0.06
+  visual_hull_consistency: 0.90 # 90% dong thuan da goc nhin (vua khit thanh hop that, khong phinh va khong loi mep nap)
+  visual_hull_gap_frac: 0.018   # chi dien diem Visual Hull tai lo khuyet MVS (xa diem MVS > 1.8% duong cheo)
   interpolation_fill:
     enable: false               # false: chi dung diem quan sat thuc, khong noi suy tuong ben gia tao
     use_visual_hull: true       # dung Mask Buoc 2 + Camera COLMAP lam bien chan ngoai
@@ -300,12 +305,16 @@ profiles:                # Ho so ghi de theo loai vat the (goi qua --profile <te
         taubin_lambda: 0.35
         taubin_mu: -0.37
 
-  sharp_cad:             # Vat the canh sac / co khi / hinh hop 90 do
+  sharp_cad:             # Vat the canh sac / co khi / hinh hop 90 do (tai tao thuc tu point cloud, khong hardcode box)
     surface_router:
       mode: "architectural_planar"
     mesh_export:
-      mesh_mode: "obb"          # hinh hop chu nhat CAD phang sac net, 90 do, 100% watertight
-      prefer_cad_box: true
+      mesh_mode: "poisson"
+      visual_hull_surface_fill: true
+      poisson_depth: 7
+      poisson_point_weight: 2.0
+      poisson_density_quantile: 0.02
+      poisson_max_dist_frac: 0.0
       remove_table_plane: true
       plane_inlier_ratio_range: [0.20, 0.70]
       plane_one_sided_min_ratio: 0.75
@@ -313,12 +322,16 @@ profiles:                # Ho so ghi de theo loai vat the (goi qua --profile <te
       table_clearance_frac: 0.006
     mesh_refine:
       remesh:
-        enable: false           # giu nguyen 6 mat phang hoan hao cua hinh hop
+        enable: true
+        target_edge_frac: 0.008
+        iterations: 3
+        feature_angle_deg: 28.0
+        adaptive: true
       smoothing:
         mode: "bilateral_normal"
         batch_iters: 2
-        max_batches: 2
-        max_drift_frac: 0.002
+        max_batches: 5
+        max_drift_frac: 0.004
         bilateral_sigma_s_scale: 1.5
         bilateral_sigma_r: 0.22
         bilateral_anchor_weight: 0.10

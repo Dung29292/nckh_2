@@ -182,17 +182,12 @@ def _orient_normals(
         _, idx = nn_query(cam_centers, pts)
         view = cam_centers[idx] - pts
         inward = np.einsum("ij,ij->i", norms, view) < 0
-        if tangent_oriented:
-            if float(np.mean(inward)) > 0.5:
-                norms *= -1.0
-                pc.normals = o3d.utility.Vector3dVector(norms)
-                print(f"  lat toan cuc phap tuyen huong ve {len(cam_centers)} camera")
-            else:
-                print(f"  phap tuyen da huong dung ve {len(cam_centers)} camera ({1.0 - float(np.mean(inward)):.1%})")
-        else:
+        # Per-point camera-facing orientation prevents tangent-plane MST from flipping whole walls inward across holes
+        n_flip = int(inward.sum())
+        if n_flip > 0:
             norms[inward] *= -1.0
             pc.normals = o3d.utility.Vector3dVector(norms)
-            print(f"  dinh huong phap tuyen theo {len(cam_centers)} camera (lat {int(inward.sum()):,})")
+        print(f"  dinh huong phap tuyen theo {len(cam_centers)} camera (lat {n_flip:,}/{n_pts:,})")
     else:
         view = pts - pts.mean(axis=0)
         inward = np.einsum("ij,ij->i", norms, view) < 0
@@ -208,95 +203,185 @@ def _orient_normals(
     return pc
 
 
-def _align_point_cloud_upright(
+def _rodrigues_align_to_z(normal: np.ndarray) -> np.ndarray:
+    """Compute exact Rodrigues rotation matrix R_gravity mapping unit `normal` strictly to (0, 0, 1)."""
+    n = np.asarray(normal, dtype=np.float64)
+    nl = float(np.linalg.norm(n))
+    if nl < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    n = n / nl
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    v = np.cross(n, z_axis)
+    s = float(np.linalg.norm(v))
+    c = float(np.dot(n, z_axis))
+    if s < 1e-10:
+        if c >= 0.0:
+            return np.eye(3, dtype=np.float64)
+        return np.diag([1.0, -1.0, -1.0]).astype(np.float64)
+    vx = np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0],
+    ], dtype=np.float64)
+    return np.eye(3, dtype=np.float64) + vx + (vx @ vx) * ((1.0 - c) / (s * s))
+
+
+def _fit_2d_min_area_yaw(xy: np.ndarray) -> float:
+    """Fit 2D Minimum Area Bounding Box on XY convex hull and return yaw (rad) aligning major axis to +X."""
+    if len(xy) < 3:
+        return 0.0
+    try:
+        import cv2
+        pts_2d = np.asarray(xy, dtype=np.float32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(pts_2d)
+        (_, _), (w_rect, h_rect), angle_deg = cv2.minAreaRect(hull)
+        # Align major (longer) dimension strictly parallel to X axis
+        major_angle_deg = float(angle_deg) if w_rect >= h_rect else float(angle_deg) + 90.0
+        return float(np.radians(major_angle_deg))
+    except Exception:
+        # Fallback: 2D covariance major axis
+        cov2 = np.cov(xy, rowvar=False)
+        _, ev2 = np.linalg.eigh(cov2)
+        major = ev2[:, 1]
+        return float(np.arctan2(major[1], major[0]))
+
+
+def _establish_canonical_frame(
     pc: o3d.geometry.PointCloud,
     support_plane: tuple[np.ndarray, float] | None = None,
     cam_centers: np.ndarray | None = None,
-) -> tuple[o3d.geometry.PointCloud, Any]:
-    pts = np.asarray(pc.points)
+) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
+    """Establish STRICTLY ONE global canonical transformation T = [R | t].
+
+    1. Detect table/base support plane via RANSAC: a*x + b*y + c*z + d = 0.
+    2. Compute Rodrigues rotation R_gravity mapping plane normal (a, b, c) strictly to (0, 0, 1).
+    3. Transform all points immediately so Z is strictly height and Z = 0 is the flat support base.
+    4. Lock in-plane yaw angle theta around Z via 2D Minimum Area Rectangle (cv2.minAreaRect)
+       aligning the longer horizontal edge strictly parallel to +X.
+
+    Returns (pc_canonical, cam_centers_canonical).
+    """
+    pts = np.asarray(pc.points, dtype=np.float64)
+    cams = np.asarray(cam_centers, dtype=np.float64) if cam_centers is not None and len(cam_centers) > 0 else np.empty((0, 3), dtype=np.float64)
     if len(pts) == 0:
-        return pc, (lambda x: x)
+        return pc, cams
+
     m_cent = pts.mean(axis=0).copy()
     centered = pts - m_cent
 
+    # Step 1: Support plane normal (a, b, c) strictly via RANSAC (zero unconstrained 3D PCA frames)
+    fitted_plane_d: float | None = None
     if support_plane is not None:
-        n_z = support_plane[0].copy()
+        n_z = np.asarray(support_plane[0], dtype=np.float64).copy()
+        n_z /= max(float(np.linalg.norm(n_z)), 1e-12)
+        fitted_plane_d = float(support_plane[1])
+        align_src = "RANSAC table plane"
     else:
+        # Initial upward hemisphere hint to select lowest 30% points for base-plane RANSAC
         _, ev = np.linalg.eigh(np.cov(centered, rowvar=False))
         spans = [float(np.ptp(centered @ ev[:, i])) for i in range(3)]
-        pca_thin_z = ev[:, int(np.argmin(spans))].copy()
-        orb_z = orbit_normal(cam_centers)
-        if orb_z is not None:
-            if np.dot(orb_z, cam_centers.mean(axis=0) - m_cent) < 0:
-                orb_z = -orb_z
-            # Neu truc mong nhat cua vat (PCA thickness) lech qua xa (>40 do) so voi mat phang quy dao bi nhieu,
-            # uu tien truc mong nhat PCA va dinh huong cung ban cau voi camera de vat luon nam phang tren mat ban!
-            if abs(float(np.dot(pca_thin_z, orb_z))) < 0.76 and (max(spans) / max(min(spans), 1e-6) >= 1.35):
-                n_z = pca_thin_z
-                if cam_centers is not None and len(cam_centers) > 0 and np.dot(n_z, cam_centers.mean(axis=0) - m_cent) < 0:
-                    n_z = -n_z
-            else:
-                n_z = orb_z
-        else:
-            n_z = pca_thin_z
-            if cam_centers is not None and len(cam_centers) > 0 and np.dot(n_z, cam_centers.mean(axis=0) - m_cent) < 0:
-                n_z = -n_z
-        n_z /= np.linalg.norm(n_z)
+        thin_z = ev[:, int(np.argmin(spans))].copy()
+        if len(cams) > 0 and float(np.dot(thin_z, cams.mean(axis=0) - m_cent)) < 0.0:
+            thin_z = -thin_z
 
-        # Refine gravity axis via RANSAC on lower boundary band (bottom 15% along initial n_z)
-        z_proj = centered @ n_z
-        z_lo, z_hi = float(np.percentile(z_proj, 1)), float(np.percentile(z_proj, 99))
-        band_idx = np.nonzero(z_proj <= z_lo + 0.15 * max(z_hi - z_lo, 1e-6))[0]
-        if len(band_idx) >= 50:
-            band_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(centered[band_idx]))
+        orb_z = orbit_normal(cams)
+        if orb_z is not None:
+            if float(np.dot(orb_z, cams.mean(axis=0) - m_cent)) < 0.0:
+                orb_z = -orb_z
+            if abs(float(np.dot(thin_z, orb_z))) < 0.82 and (max(spans) / max(min(spans), 1e-6) >= 1.35):
+                up_hint = thin_z
+            else:
+                up_hint = orb_z
+        else:
+            up_hint = thin_z
+        up_hint /= max(float(np.linalg.norm(up_hint)), 1e-12)
+
+        n_z = up_hint.copy()
+        align_src = "camera hemisphere"
+
+        z_proj = centered @ up_hint
+        z_p30 = float(np.percentile(z_proj, 30.0))
+        z_span = max(float(np.percentile(z_proj, 99.0) - np.percentile(z_proj, 1.0)), 1e-6)
+        low_idx = np.nonzero(z_proj <= z_p30)[0]
+        if len(low_idx) >= 50:
+            low_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(centered[low_idx]))
             try:
-                dist_thr = max(0.015 * max(z_hi - z_lo, 1e-6), 1e-5)
-                p_model, p_inl = band_pc.segment_plane(distance_threshold=dist_thr, ransac_n=3, num_iterations=600)
+                dist_thr = max(0.02 * z_span, 1e-5)
+                p_model, p_inl = low_pc.segment_plane(distance_threshold=dist_thr, ransac_n=3, num_iterations=1000)
                 p_n = np.asarray(p_model[:3], dtype=np.float64)
                 p_nl = float(np.linalg.norm(p_n))
-                if p_nl > 1e-8 and len(p_inl) >= max(30, int(0.35 * len(band_idx))):
+                if p_nl > 1e-8 and len(p_inl) >= max(30, int(0.20 * len(low_idx))):
                     p_n /= p_nl
-                    if float(np.dot(p_n, n_z)) < 0.0:
+                    if float(np.dot(p_n, up_hint)) < 0.0:
                         p_n = -p_n
-                    # Accept RANSAC base plane if within 20 deg of initial gravity axis
-                    if float(np.dot(p_n, n_z)) >= 0.94:
+                    # Only accept RANSAC base plane if within 25 deg of camera orbit axis (prevents sideways flip!)
+                    if float(np.dot(p_n, up_hint)) >= 0.90:
                         n_z = p_n
+                        align_src = "RANSAC base plane (lowest 30%)"
             except Exception:
                 pass
-    n_z /= np.linalg.norm(n_z)
 
-    proj = centered - np.outer(centered @ n_z, n_z)
-    _, ev2 = np.linalg.eigh(np.cov(proj, rowvar=False))
-    n_x = ev2[:, 2] - np.dot(ev2[:, 2], n_z) * n_z
-    n_x /= np.linalg.norm(n_x)
-    n_y = np.cross(n_z, n_x)
-    n_y /= np.linalg.norm(n_y)
+    # Step 2: Rodrigues rotation R_gravity aligning (a, b, c) strictly to (0, 0, 1)
+    # Guarantee cameras lie ABOVE the object (+Z = up, Z = 0 = table base) to prevent upside-down flips
+    if len(cams) > 0 and float(np.dot(n_z, cams.mean(axis=0) - m_cent)) < 0.0:
+        n_z = -n_z
+        if fitted_plane_d is not None:
+            fitted_plane_d = -fitted_plane_d
+    R_gravity = _rodrigues_align_to_z(n_z)
 
-    R = np.vstack([n_x, n_y, n_z])
-    p_rot = centered @ R.T
-
-    shift_x = 0.5 * (p_rot[:, 0].min() + p_rot[:, 0].max())
-    shift_y = 0.5 * (p_rot[:, 1].min() + p_rot[:, 1].max())
-    if support_plane is not None:
-        n, d = support_plane
-        shift_z = -(float(n @ m_cent) + d)
+    # Step 3: Transform all points immediately relative to centroid on support plane
+    if support_plane is not None and fitted_plane_d is not None:
+        dist_cent = float(n_z @ m_cent) + fitted_plane_d
+        centroid_on_plane = m_cent - dist_cent * n_z
     else:
-        shift_z = float(p_rot[:, 2].min())
+        p_tmp = centered @ R_gravity.T
+        z_floor = float(np.percentile(p_tmp[:, 2], 0.5))
+        centroid_on_plane = m_cent + z_floor * n_z
 
-    post_shift = np.array([shift_x, shift_y, shift_z], dtype=np.float64)
-    p_rot -= post_shift[None, :]
+    p_grav = (pts - centroid_on_plane[None, :]) @ R_gravity.T
+
+    # Step 4: Lock in-plane yaw angle theta around Z via 2D Minimum Area Rectangle (longer edge -> +X)
+    yaw = _fit_2d_min_area_yaw(p_grav[:, :2])
+    cos_y, sin_y = float(np.cos(-yaw)), float(np.sin(-yaw))
+    R_z = np.array([
+        [cos_y, -sin_y, 0.0],
+        [sin_y,  cos_y, 0.0],
+        [0.0,    0.0,   1.0],
+    ], dtype=np.float64)
+
+    R = R_z @ R_gravity
+    p_can = (pts - centroid_on_plane[None, :]) @ R.T
+
+    if float(np.ptp(p_can[:, 1])) > float(np.ptp(p_can[:, 0])):
+        R_90 = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        R = R_90 @ R
+        p_can = (pts - centroid_on_plane[None, :]) @ R.T
+
+    xy_shift = np.array([
+        0.5 * (float(p_can[:, 0].min()) + float(p_can[:, 0].max())),
+        0.5 * (float(p_can[:, 1].min()) + float(p_can[:, 1].max())),
+        0.0,
+    ], dtype=np.float64)
+    p_can -= xy_shift[None, :]
+    # Ensure Z = 0 is the flat support base
+    z_min_can = float(p_can[:, 2].min())
+    if z_min_can < 0.0 or support_plane is None:
+        p_can[:, 2] -= z_min_can
+        xy_shift[2] = z_min_can
 
     out = o3d.geometry.PointCloud()
-    out.points = o3d.utility.Vector3dVector(p_rot)
+    out.points = o3d.utility.Vector3dVector(p_can)
     if pc.has_colors():
         out.colors = pc.colors
     if pc.has_normals():
-        out.normals = o3d.utility.Vector3dVector(np.asarray(pc.normals) @ R.T)
+        out.normals = o3d.utility.Vector3dVector(np.asarray(pc.normals, dtype=np.float64) @ R.T)
 
-    print(f"  can truc: X={np.ptp(p_rot[:,0]):.3f} Y={np.ptp(p_rot[:,1]):.3f} "
-          f"Z=[{p_rot[:,2].min():.3f}, {p_rot[:,2].max():.3f}] "
-          f"({'theo mat ban' if support_plane is not None else 'theo quy dao/PCA'})")
-    return out
+    cams_can = ((cams - centroid_on_plane[None, :]) @ R.T) - xy_shift[None, :] if len(cams) > 0 else cams
+
+    print(f"  Single Canonical Frame ({align_src} + Rodrigues + 2D minAreaRect): "
+          f"X={np.ptp(p_can[:,0]):.3f} Y={np.ptp(p_can[:,1]):.3f} "
+          f"Z=[{p_can[:,2].min():.3f}, {p_can[:,2].max():.3f}]")
+    return out, cams_can
 
 
 def _reconstruct_bpa(pc: o3d.geometry.PointCloud, diag: float, e: dict[str, Any]) -> o3d.geometry.TriangleMesh:
@@ -758,12 +843,96 @@ def _finalize_mesh(mesh: o3d.geometry.TriangleMesh, diag: float, e: dict[str, An
     return mesh
 
 
+def _fill_textureless_voids_with_visual_hull(
+    pc: o3d.geometry.PointCloud,
+    sample_name: str,
+    diag: float,
+    e: dict[str, Any],
+) -> o3d.geometry.PointCloud:
+    """Fill textureless MVS voids using genuine multi-view 3D Visual Hull silhouette carving (object-agnostic, 0 VRAM).
+
+    Only inserts Visual Hull boundary points where MVS has no points (distance > gap_frac * diag),
+    leaving all observed MVS surface geometry untouched.
+    """
+    if not bool(e.get("visual_hull_surface_fill", False)) or len(pc.points) < 50:
+        return pc
+    sdir = paths.sample_dir(sample_name)
+    if not sdir.exists():
+        return pc
+
+    try:
+        from scipy.ndimage import binary_erosion, gaussian_filter
+        from nckh_2.pipeline.completion.visibility import (
+            build_visual_hull,
+            load_calibrated_views,
+            select_consistent_stationary_views,
+        )
+
+        all_views = load_calibrated_views(sdir)
+        views = select_consistent_stationary_views(all_views)
+        if len(views) < 3:
+            return pc
+
+        pts = np.asarray(pc.points, dtype=np.float64)
+        res = int(e.get("visual_hull_res", 96))
+        pad = float(e.get("visual_hull_pad_frac", 0.15))
+        cons = float(e.get("visual_hull_consistency", 0.80))
+        vh = build_visual_hull(pts, views, grid_res=res, pad_frac=pad, min_mask_consistency=cons)
+        occ = vh.occupied
+        if int(occ.sum()) < 50:
+            return pc
+
+        # Extract outer boundary shell of the 3D Visual Hull
+        surf = occ & (~binary_erosion(occ))
+        surf_idx = np.argwhere(surf)
+        if len(surf_idx) < 20:
+            return pc
+
+        surf_pts = vh.origin[None, :] + (surf_idx.astype(np.float64) + 0.5) * vh.voxel_size[None, :]
+
+        # Keep only Visual Hull points that lie inside genuine MVS voids
+        gap_rad = max(float(e.get("visual_hull_gap_frac", 0.018)) * diag, 1e-6)
+        dists, nn_idx = nn_query(pts, surf_pts)
+        void_mask = dists > gap_rad
+        n_add = int(np.sum(void_mask))
+        if n_add == 0:
+            return pc
+
+        add_pts = surf_pts[void_mask]
+        add_idx = surf_idx[void_mask]
+
+        # Compute outward normals directly from smoothed occupancy field gradient
+        smooth_occ = gaussian_filter(occ.astype(np.float64), sigma=1.2)
+        gx, gy, gz = np.gradient(smooth_occ)
+        nx = -gx[add_idx[:, 0], add_idx[:, 1], add_idx[:, 2]]
+        ny = -gy[add_idx[:, 0], add_idx[:, 1], add_idx[:, 2]]
+        nz = -gz[add_idx[:, 0], add_idx[:, 1], add_idx[:, 2]]
+        add_nrms = np.column_stack([nx, ny, nz])
+        n_len = np.maximum(np.linalg.norm(add_nrms, axis=1, keepdims=True), 1e-12)
+        add_nrms /= n_len
+
+        out = o3d.geometry.PointCloud()
+        out.points = o3d.utility.Vector3dVector(np.vstack([pts, add_pts]))
+        if pc.has_colors() and len(pc.colors) == len(pts):
+            cols = np.asarray(pc.colors, dtype=np.float64)
+            out.colors = o3d.utility.Vector3dVector(np.vstack([cols, cols[nn_idx[void_mask]]]))
+        if pc.has_normals() and len(pc.normals) == len(pts):
+            nrms = np.asarray(pc.normals, dtype=np.float64)
+            out.normals = o3d.utility.Vector3dVector(np.vstack([nrms, add_nrms]))
+
+        print(f"  Visual Hull void-fill ({len(views)} views, res={res}): +{n_add:,} diem lap vung khong van -> {len(out.points):,} diem")
+        return out
+    except Exception as err:
+        print(f"  [Canh bao] Visual Hull void-fill bo qua: {err}")
+        return pc
+
+
 def run(sample_name: str, cfg: dict[str, Any]) -> None:
     e = cfg["mesh_export"]
-    mode = str(e.get("mesh_mode", "both")).strip().lower()
+    mode = str(e.get("mesh_mode", "poisson")).strip().lower()
     if mode not in ("bpa", "poisson", "both"):
-        print(f"  mesh_mode '{mode}' khong hop le -> dung 'both'")
-        mode = "both"
+        print(f"  mesh_mode '{mode}' khong hop le -> dung 'poisson'")
+        mode = "poisson"
 
     out_dir = paths.output_dir(sample_name)
     ply_path = out_dir / "point_cloud.ply"
@@ -782,6 +951,7 @@ def run(sample_name: str, cfg: dict[str, Any]) -> None:
     if len(pc.points) == 0:
         raise RuntimeError("Khong co diem nao trong point cloud.")
 
+    # 1. Strip faraway dust floaters first (Euclidean rigid-invariant SOR/ROR/DBSCAN) so outliers cannot skew RANSAC or 2D OBB
     print("[Buoc 4] Loc nhieu (Statistical + Radius + DBSCAN)...")
     pc, diag = _clean(pc, e)
 
@@ -790,8 +960,21 @@ def run(sample_name: str, cfg: dict[str, Any]) -> None:
     print("[Buoc 4] Tach mat ban (RANSAC)...")
     pc, support_plane = _remove_plane_ransac(pc, diag, e, cam_centers)
 
-    print("[Buoc 4] Dinh huong phap tuyen...")
+    # 1b. Fill textureless MVS voids using genuine multi-view Visual Hull silhouettes (in COLMAP frame)
+    pc = _fill_textureless_voids_with_visual_hull(pc, sample_name, diag, e)
+
+    # 2. Establish STRICTLY ONE global canonical frame T = [R | t] on clean inliers, then discard camera frame
+    if e.get("align_upright", True):
+        print("[Buoc 4] Thiet lap he toa do chuan duy nhat (Single Canonical Frame T = [R | t])...")
+        pc, cam_centers = _establish_canonical_frame(pc, support_plane, cam_centers)
+        diag = max(robust_diag(np.asarray(pc.points, dtype=np.float64)), 1e-6)
+    else:
+        support_plane = None
+
+    # 3. ALL normals, MLS, Poisson & planar base capping run EXCLUSIVELY inside P_canonical
+    print("[Buoc 4] Dinh huong phap tuyen trong he chuan...")
     pc = _orient_normals(pc, cam_centers, diag, e)
+    cam_centers = np.empty((0, 3), dtype=np.float64)  # Camera frame discarded after outward sign check
 
     mls_iter = int(e.get("mls_iter", 2))
     if mls_iter > 0:
@@ -811,18 +994,7 @@ def run(sample_name: str, cfg: dict[str, Any]) -> None:
             chunk_size=int(e.get("mls_chunk_size", 40000)),
         )
 
-    # Bu khuyet bang noi suy (Per-Component Symmetry + Visual Hull + Biharmonic) trong he toa do COLMAP goc
     point_conf: np.ndarray | None = None
-    interp_cfg = e.get("interpolation_fill", {})
-    if isinstance(interp_cfg, dict) and bool(interp_cfg.get("enable", False)):
-        print("[Buoc 4] Bu khuyet vat the bang noi suy (Symmetry + Visual Hull + Biharmonic)...")
-        from nckh_2.backends.interpolation import fill_point_cloud_holes
-        pc, point_conf, _interp_stats = fill_point_cloud_holes(
-            pc,
-            sample_dir=paths.sample_dir(sample_name),
-            interp_cfg=interp_cfg,
-        )
-
     ns_iter = int(e.get("normal_smooth_iter", 3))
     if ns_iter > 0:
         print("[Buoc 4] Lam muot truong phap tuyen k-NN...")
@@ -832,12 +1004,6 @@ def run(sample_name: str, cfg: dict[str, Any]) -> None:
             k=int(e.get("normal_smooth_k", 25)),
             sigma_angle_deg=float(e.get("normal_smooth_sigma_deg", 45.0)),
         )
-
-    if e.get("align_upright", True):
-        print("[Buoc 4] Can thang truc point cloud...")
-        pc = _align_point_cloud_upright(pc, support_plane, cam_centers)
-    else:
-        support_plane = None
 
     o3d.io.write_point_cloud(str(clean_ply), pc)
     o3d.io.write_point_cloud(str(aligned_ply), pc)
